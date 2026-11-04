@@ -1,4 +1,4 @@
-import { createManagedInstantlyClient, planInstantlySenderRemoval } from "@/lib/managed-outreach/instantly";
+import { createManagedInstantlyClient, planInstantlySenderRemoval, planInstantlyAccountTagRemoval } from "@/lib/managed-outreach/instantly";
 
 const sender = "mayank@example.net";
 const original = { id: "campaign-a", name: "Existing campaign", status: 1, email_list: ["other@example.net", sender, "third@example.net"], email_tag_list: [] };
@@ -84,5 +84,65 @@ describe("exact existing mailbox reservation", () => {
     expect(new URL(fetcher.mock.calls[1][0]).searchParams.get("starting_after")).toBe("cursor");
     const looping = jest.fn().mockImplementation(async () => new Response(JSON.stringify({ items: [row], next_starting_after: "same" })));
     await expect(createManagedInstantlyClient("test", { fetch: looping as typeof fetch }).listAccountCampaigns(sender)).rejects.toMatchObject({ code: "pagination_incomplete" });
+  });
+});
+
+describe("account-only campaign tag reservation", () => {
+  const tagsCampaign = { ...original, email_tag_list: ["tag-used"] };
+  const initialMappings = [
+    { id: "mapping-used", tag_id: "tag-used", resource_id: sender, resource_type: 1 as const },
+    { id: "mapping-keep", tag_id: "tag-unrelated", resource_id: sender, resource_type: 1 as const },
+  ];
+  function tagFixture(options: { lostResponse?: boolean; changedBefore?: boolean; badAfter?: boolean } = {}) {
+    let mappings = structuredClone(initialMappings); let reads = 0;
+    const audit = jest.fn(async () => undefined);
+    const fetcher = jest.fn(async (url: string, init: RequestInit) => {
+      const parsed = new URL(url);
+      if (parsed.pathname.endsWith("/custom-tag-mappings")) {
+        expect(parsed.searchParams.get("resource_ids")).toBe(sender);
+        reads++;
+        if (options.changedBefore && reads === 2) mappings.push({ id: "changed", tag_id: "concurrent", resource_id: sender, resource_type: 1 });
+        return new Response(JSON.stringify({ items: mappings }));
+      }
+      if (parsed.pathname.endsWith("/toggle-resource")) {
+        expect(audit).toHaveBeenCalledTimes(1);
+        expect(JSON.parse(init.body as string)).toEqual({ tag_ids: ["tag-used"], resource_ids: [sender], resource_type: 1, selected_all: false, assign: false });
+        mappings = mappings.filter(row => row.tag_id !== "tag-used");
+        if (options.badAfter) mappings = [];
+        if (options.lostResponse) throw new Error("lost response");
+        return new Response(JSON.stringify({ success: true }));
+      }
+      expect(init.method).toBe("GET");
+      return new Response(JSON.stringify(tagsCampaign));
+    });
+    return { client: createManagedInstantlyClient("test-key", { fetch: fetcher as typeof fetch }), fetcher, audit,
+      plan: planInstantlyAccountTagRemoval(tagsCampaign, sender, initialMappings) };
+  }
+  it("unassigns only campaign-used tags from the exact account and retains unrelated tags", async () => {
+    const { client, plan, audit, fetcher } = tagFixture();
+    const result = await client.removeAccountTagsForCampaign(original.id, sender, plan.fingerprint, audit);
+    expect(result).toMatchObject({ removeTagIds: ["tag-used"], after: [initialMappings[1]], outcome: "removed" });
+    expect(fetcher.mock.calls.filter(call => call[1].method !== "GET")).toHaveLength(1);
+    expect(fetcher.mock.calls.some(call => call[1].method === "PATCH")).toBe(false);
+  });
+  it("requires durable intent and rejects concurrent account-tag changes", async () => {
+    const first = tagFixture();
+    first.audit.mockRejectedValueOnce(new Error("Cannot save intent"));
+    await expect(first.client.removeAccountTagsForCampaign(original.id, sender, first.plan.fingerprint, first.audit)).rejects.toThrow("Cannot save intent");
+    expect(first.fetcher.mock.calls.some(call => call[1].method === "POST")).toBe(false);
+    const second = tagFixture({ changedBefore: true });
+    await expect(second.client.removeAccountTagsForCampaign(original.id, sender, second.plan.fingerprint, second.audit)).rejects.toMatchObject({ code: "launch_blocked", outcomeUnknown: false });
+    expect(second.fetcher.mock.calls.some(call => call[1].method === "POST")).toBe(false);
+  });
+  it.each([{ lostResponse: true }, { badAfter: true }])("does not retry uncertain tag unassignments: %j", async options => {
+    const { client, plan, audit, fetcher } = tagFixture(options);
+    await expect(client.removeAccountTagsForCampaign(original.id, sender, plan.fingerprint, audit)).rejects.toMatchObject({ outcomeUnknown: true });
+    expect(fetcher.mock.calls.filter(call => call[1].method === "POST")).toHaveLength(1);
+  });
+  it("rejects wrong resources and allows direct removal only after tag absence is proved", () => {
+    expect(() => planInstantlyAccountTagRemoval(tagsCampaign, sender, [{ ...initialMappings[0], resource_id: "other@example.net" }])).toThrow();
+    expect(() => planInstantlySenderRemoval(tagsCampaign, sender)).toThrow();
+    expect(() => planInstantlySenderRemoval(tagsCampaign, sender, ["tag-used"])).toThrow();
+    expect(planInstantlySenderRemoval(tagsCampaign, sender, ["tag-unrelated"]).after).toEqual(["other@example.net", "third@example.net"]);
   });
 });

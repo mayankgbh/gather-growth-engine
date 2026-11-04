@@ -24,7 +24,7 @@ beforeEach(() => {
   prisma.workspace.findUnique.mockResolvedValue({ id: "workspace" });
   client = { listAccounts: jest.fn().mockResolvedValue([{ email: sender }]),
     listAccountCampaigns: jest.fn().mockResolvedValue([{ campaign_id: "a", campaign_name: "Existing", status: 1 }]),
-    getCampaign: jest.fn().mockResolvedValue(campaign), removeSenderFromCampaign: jest.fn(async (_id, _sender, _fp, audit) => {
+    getCampaign: jest.fn().mockResolvedValue(campaign), getSenderRemovalPlan: jest.fn().mockResolvedValue(plan), getAccountTagRemovalPlan: jest.fn().mockResolvedValue({ ...plan, removeTagIds: ["tag"] }), removeAccountTagsForCampaign: jest.fn(async (_id, _sender, _fp, audit) => { await audit(plan); return { ...plan, outcome: "removed", checkedAt: "2026-11-04T22:00:00Z" }; }), removeSenderFromCampaign: jest.fn(async (_id, _sender, _fp, audit) => {
       await audit(plan); return { ...plan, outcome: "removed", checkedAt: "2026-11-04T22:00:00Z" };
     }) };
   getManagedInstantlyClientForUserId.mockResolvedValue(client);
@@ -46,6 +46,16 @@ describe("sender reservation setup endpoint", () => {
     expect(result.status).toBe(200);
     expect(await result.json()).toMatchObject({ outcome: "removed", prospectEmailSent: false });
     expect(prisma.managedOutreachEvent.create.mock.calls.map((args: any[]) => args[0].data.type)).toEqual(["sender_reservation_attempt", "sender_reservation_confirmed"]);
+  });
+  it("routes the tag plan and mutation only through exact-account tag unassignment", async () => {
+    const preview = await GET(new Request("https://example.com/api/managed-outreach/sender-reservation?campaignId=a&tags=1"));
+    expect(await preview.json()).toMatchObject({ action: "remove_sender_tags", removeTagIds: ["tag"] });
+    const result = await POST(request({ ...input, action: "remove_sender_tags" }));
+    expect(result.status).toBe(200);
+    expect(client.removeAccountTagsForCampaign).toHaveBeenCalledWith("a", sender, plan.fingerprint, expect.any(Function));
+    expect(client.removeSenderFromCampaign).not.toHaveBeenCalled();
+    const data = JSON.parse(prisma.managedOutreachEvent.create.mock.calls[0][0].data.dataJson);
+    expect(data.mutationFields).toEqual(["exact_account_tag_associations"]);
   });
   it.each([{ ...input, senderEmail: "other@example.net" }, { ...input, workspaceId: "other" }])("rejects caller-selected sender or workspace: %j", async body => {
     expect((await POST(request(body))).status).toBe(400);

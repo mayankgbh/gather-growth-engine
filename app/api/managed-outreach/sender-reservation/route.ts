@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getManagedOwner } from "@/lib/managed-outreach/auth";
 import { getManagedInstantlyClientForUserId } from "@/lib/managed-outreach/client";
-import { ManagedInstantlyError, planInstantlySenderRemoval } from "@/lib/managed-outreach/instantly";
+import { ManagedInstantlyError, type InstantlySenderRemovalPlan, type InstantlyAccountTagRemovalPlan } from "@/lib/managed-outreach/instantly";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -33,12 +33,12 @@ export async function GET(request: Request) {
     if (!campaignId) return json({ senderEmail: ctx.senderEmail, checkedAt: new Date().toISOString(), complete: true,
       mappings: ctx.mappings, reserved: ctx.mappings.length === 0, sendingEnabled: process.env.MANAGED_OUTREACH_SEND_ENABLED === "true" });
     if (!ctx.mappings.some(row => row.campaign_id === campaignId)) return json({ error: "Campaign is not currently mapped to the configured sender." }, 409);
-    const campaign = await ctx.client.getCampaign(campaignId);
-    if (campaign.id !== campaignId) return json({ error: "Unexpected provider campaign identity." }, 409);
     const managed = await prisma.managedOutreachJob.findFirst({ where: { workspaceId: ctx.workspace.id, providerCampaignId: campaignId }, select: { id: true } });
     if (managed) return json({ error: "Managed outreach campaigns are excluded from sender reservation." }, 409);
-    return json({ ...planInstantlySenderRemoval(campaign, ctx.senderEmail), checkedAt: new Date().toISOString(),
-      source: "https://developer.instantly.ai/api-reference/campaign/patch-campaign" });
+    const tags = new URL(request.url).searchParams.get("tags") === "1";
+    const plan = tags ? await ctx.client.getAccountTagRemovalPlan(campaignId, ctx.senderEmail) : await ctx.client.getSenderRemovalPlan(campaignId, ctx.senderEmail);
+    return json({ ...plan, action: tags ? "remove_sender_tags" : "remove_sender", checkedAt: new Date().toISOString(),
+      source: tags ? "https://developer.instantly.ai/api-reference/customtag/assign-or-unassign-tags-to-resources" : "https://developer.instantly.ai/api-reference/campaign/patch-campaign" });
   } catch (error) {
     return json({ error: error instanceof ManagedInstantlyError ? error.message : "Sender reservation evidence could not be completely checked.",
       outcomeUnknown: false }, error instanceof ManagedInstantlyError && error.code === "launch_blocked" ? 409 : 503);
@@ -57,7 +57,7 @@ export async function POST(request: Request) {
     if (raw.length > 2000) return json({ error: "Request too large." }, 413);
     const body = JSON.parse(raw);
     if (!body || typeof body !== "object" || Array.isArray(body)
-      || body.action !== "remove_sender" || typeof body.campaignId !== "string" || typeof body.senderEmail !== "string"
+      || !["remove_sender", "remove_sender_tags"].includes(body.action) || typeof body.campaignId !== "string" || typeof body.senderEmail !== "string"
       || !/^[a-f0-9]{64}$/.test(body.fingerprint) || Object.keys(body).some(key => !["action", "campaignId", "senderEmail", "fingerprint"].includes(key))) return json({ error: "An exact saved sender-removal plan is required." }, 400);
     const ctx = await context(request);
     if (ctx.error) return ctx.error;
@@ -67,21 +67,25 @@ export async function POST(request: Request) {
     const managed = await prisma.managedOutreachJob.findFirst({ where: { workspaceId: ctx.workspace.id, providerCampaignId: body.campaignId }, select: { id: true } });
     if (managed) return json({ error: "Managed outreach campaigns cannot be changed by this setup action." }, 409);
     workspaceId = ctx.workspace.id;
+    const tags = body.action === "remove_sender_tags";
     const key = createHash("sha256").update(JSON.stringify([workspaceId, ctx.senderEmail, body.campaignId, body.fingerprint])).digest("hex");
-    const operationId = `managed:sender-removal:${key}`;
+    const operationId = `managed:${tags ? "sender-tag-removal" : "sender-removal"}:${key}`;
     const previous = await prisma.managedOutreachEvent.findUnique({ where: { id: `${operationId}:attempt` } });
     if (previous) return json({ error: "This removal was previously attempted. Inspect its saved evidence and current provider state before another mutation.", evidenceRecordId: previous.id, outcomeUnknown: true }, 409);
-    const result = await ctx.client.removeSenderFromCampaign(body.campaignId, ctx.senderEmail, body.fingerprint, async plan => {
+    const audit = async (plan: InstantlySenderRemovalPlan | InstantlyAccountTagRemovalPlan) => {
       await prisma.managedOutreachEvent.create({ data: { id: `${operationId}:attempt`, workspaceId: ctx.workspace.id,
         type: "sender_reservation_attempt", occurredAt: new Date(), dataJson: JSON.stringify({ ...plan,
-          source: "Instantly API v2 account mapping + GET/PATCH campaign", mutationFields: ["email_list"], countsAsCampaignSend: false }) } });
+          source: tags ? "Instantly API v2 exact account tag mapping + unassign resource" : "Instantly API v2 account mapping + GET/PATCH campaign",
+          mutationFields: tags ? ["exact_account_tag_associations"] : ["email_list"], countsAsCampaignSend: false }) } });
       auditId = operationId;
-    });
+    };
+    const result = tags ? await ctx.client.removeAccountTagsForCampaign(body.campaignId, ctx.senderEmail, body.fingerprint, audit)
+      : await ctx.client.removeSenderFromCampaign(body.campaignId, ctx.senderEmail, body.fingerprint, audit);
     providerOutcomeConfirmed = true;
     const receiptId = `${operationId}:confirmed`;
     await prisma.managedOutreachEvent.create({ data: { id: receiptId, workspaceId: ctx.workspace.id,
       type: "sender_reservation_confirmed", occurredAt: new Date(result.checkedAt),
-      dataJson: JSON.stringify({ ...result, source: "Instantly GET campaign after PATCH", countsAsCampaignSend: false }) } });
+      dataJson: JSON.stringify({ ...result, source: tags ? "Instantly account tag readback after exact unassign" : "Instantly GET campaign after PATCH", countsAsCampaignSend: false }) } });
     return json({ ...result, evidenceRecordId: receiptId, prospectEmailSent: false });
   } catch (error) {
     const outcomeUnknown = providerOutcomeConfirmed || (error instanceof ManagedInstantlyError ? error.outcomeUnknown : !!auditId);

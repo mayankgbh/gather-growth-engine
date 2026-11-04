@@ -195,8 +195,8 @@ export async function dispatchManagedJob(owner: { userId: string; workspaceId: s
   const account = accounts.find(value => value.email.toLowerCase() === job.senderEmail);
   if (!account || account.status !== 1 || account.setup_pending || account.warmup_status !== 1
     || typeof account.daily_limit !== "number" || account.daily_limit < 1) block("mailbox_unavailable", "The selected mailbox is not currently connected and ready.");
-  const campaigns = await client.listCampaigns();
-  if (campaigns.some(campaign => campaign.id !== job.providerCampaignId && campaign.status === 1 && campaign.email_list?.some(email => email.toLowerCase() === job.senderEmail))) block("sender_busy", "Another active campaign is using the selected mailbox.");
+  const campaigns = await client.listAccountCampaigns(job.senderEmail);
+  if (campaigns.some(campaign => campaign.campaign_id !== job.providerCampaignId && campaign.status === 1)) block("sender_busy", "Another active campaign is using the selected mailbox, directly or through account tags.");
   if (await client.isSuppressed(job.email)) block("suppressed", "The recipient is on the provider suppression list.");
   if ((await client.listInboundEmails({ leadEmail: job.email })).length) block("incoming_reply", "Incoming mail from this recipient requires review before any further send.");
   if (job.nextStep === 1 && (await client.listEmails({ leadEmail: job.email })).length) block("existing_contact", "The provider already has message history for this recipient.");

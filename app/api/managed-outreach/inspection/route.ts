@@ -37,15 +37,22 @@ export async function GET(request: Request) {
     const startDate = new Date(Date.now() - 30 * 86_400_000).toISOString().slice(0, 10);
     const results = await Promise.allSettled([
       client.getAccountHealth(senderEmail, { startDate, endDate }),
-      client.listCampaigns(),
+      client.listAccountCampaigns(senderEmail),
+      client.listEmailsPage({ accountEmail: senderEmail, emailType: "received" }),
     ]);
     const health = results[0].status === "fulfilled" ? results[0].value : null;
     const workspace = await prisma.workspace.findUnique({ where: { userId: owner.id }, select: { id: true } });
     const diagnostic = workspace ? await prisma.managedOutreachEvent.findFirst({ where: { workspaceId: workspace.id, type: "sender_dns_diagnostic" }, orderBy: { occurredAt: "desc" } }) : null;
     const diagnosticData = diagnostic ? JSON.parse(diagnostic.dataJson) : null;
     const dnsEvidence = diagnosticData?.email === senderEmail ? { checkedAt: diagnostic!.occurredAt.toISOString(), ...diagnosticData } : null;
-    const campaigns = results[1].status === "fulfilled" ? results[1].value.filter(c => c.email_list?.some(email => email.toLowerCase() === senderEmail)).map(c => ({ id: c.id, name: c.name, status: c.status })) : null;
-    return NextResponse.json({ ...base, senderEmail, health, dnsEvidence, campaigns, complete: results.every(r => r.status === "fulfilled") }, { headers });
+    const campaigns = results[1].status === "fulfilled" ? results[1].value.map(c => ({ id: c.campaign_id, name: c.campaign_name, status: c.status })) : null;
+    const replyPage = results[2].status === "fulfilled" && results[2].value.items.every(item => item.ue_type === 2 && item.eaccount.toLowerCase() === senderEmail) ? results[2].value : null;
+    const replyCollection = replyPage ? { checkedAt: new Date().toISOString(), accessible: true, pageCount: 1,
+      receivedCountOnPage: replyPage.items.filter(item => item.ue_type === 2).length,
+      hasMore: !!replyPage.next_starting_after, completeHistory: !replyPage.next_starting_after,
+      latestReceivedAtOnPage: replyPage.items.filter(item => item.ue_type === 2).map(item => item.timestamp_created).sort().at(-1) ?? null,
+      source: "Instantly GET emails filtered by exact account and received direction; access evidence only, not a complete reply check." } : null;
+    return NextResponse.json({ ...base, senderEmail, health, dnsEvidence, campaigns, replyCollection, complete: results.every(r => r.status === "fulfilled") && replyPage !== null }, { headers });
   } catch {
     return NextResponse.json({ error: "Operational evidence could not be completely checked." }, { status: 503, headers });
   }

@@ -34,7 +34,7 @@ function harness() {
     stop_on_auto_reply: true, stop_for_company: true, sequences: [{ steps: [{ type: "email", delay: 0, variants: [{ subject: steps[0].subject, body: "provider body" }] }] }] };
   const client = {
     listAccounts: jest.fn().mockResolvedValue([{ email: config.senderEmail, status: 1, setup_pending: false, warmup_status: 1, daily_limit: 20 }]),
-    listCampaigns: jest.fn().mockResolvedValue([]), isSuppressed: jest.fn().mockResolvedValue(false), listInboundEmails: jest.fn().mockResolvedValue([]),
+    listAccountCampaigns: jest.fn().mockResolvedValue([]), isSuppressed: jest.fn().mockResolvedValue(false), listInboundEmails: jest.fn().mockResolvedValue([]),
     listEmails: jest.fn().mockResolvedValue([]), createPausedCampaign: jest.fn().mockResolvedValue(campaign),
     uploadVerifiedLead: jest.fn().mockResolvedValue({ leads_uploaded: 1, in_blocklist: 0, duplicated_leads: 0, skipped_count: 0, invalid_email_count: 0, created_leads: [{ id: "lead-1", index: 0 }] }),
     getCampaign: jest.fn().mockResolvedValue(campaign), activateCampaign: jest.fn().mockResolvedValue({ ...campaign, status: 1 }),
@@ -179,7 +179,7 @@ describe("managed outbound orchestration", () => {
   it("rechecks external receipt age after slow provider reads before reserving a send", async () => {
     const h = harness(); await h.run(); let time = NOW;
     h.deps.now = () => time;
-    h.client.listCampaigns.mockImplementation(async () => { time = new Date(NOW.getTime() + 65_000); return []; });
+    h.client.listAccountCampaigns.mockImplementation(async () => { time = new Date(NOW.getTime() + 65_000); return []; });
     await expect(h.run({ ...input(), action: "activate" })).rejects.toMatchObject({ code: "crm_not_clear" });
     expect(h.store.claimBudgetAndJob).not.toHaveBeenCalled(); expect(h.client.activateCampaign).not.toHaveBeenCalled();
   });
@@ -201,7 +201,7 @@ describe("managed outbound orchestration", () => {
   });
 
   it("does not stage when a different active campaign uses the selected sender", async () => {
-    const h = harness(); h.client.listCampaigns.mockResolvedValue([{ id: "unrelated", status: 1, email_list: [config.senderEmail] }]);
+    const h = harness(); h.client.listAccountCampaigns.mockResolvedValue([{ campaign_id: "unrelated", status: 1 }]);
     await expect(h.run()).rejects.toMatchObject({ code: "sender_busy" }); expect(h.client.createPausedCampaign).not.toHaveBeenCalled();
   });
 

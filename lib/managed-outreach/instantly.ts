@@ -198,6 +198,12 @@ export type InstantlySenderRemovalPlan = {
   campaignId: string; campaignName: string; status: number; senderEmail: string;
   before: string[]; after: string[]; fingerprint: string; alreadyAbsent: boolean;
 };
+export type InstantlyAccountTagMapping = { id: string; tag_id: string; resource_id: string; resource_type: 1 };
+export type InstantlyAccountTagRemovalPlan = {
+  campaignId: string; campaignName: string; senderEmail: string; campaignTagIds: string[];
+  before: InstantlyAccountTagMapping[]; after: InstantlyAccountTagMapping[];
+  removeTagIds: string[]; fingerprint: string; alreadyAbsent: boolean;
+};
 export type InstantlyAccountHealth = {
   observedAt: string;
   account: ManagedInstantlyAccount;
@@ -298,15 +304,16 @@ export function planInstantlyFollowup(campaign: ManagedInstantlyCampaign, input:
 }
 
 /** Reviewable exact removal; no other campaign settings are part of the PATCH. */
-export function planInstantlySenderRemoval(campaign: ManagedInstantlyCampaign, senderEmail: string): InstantlySenderRemovalPlan {
+export function planInstantlySenderRemoval(campaign: ManagedInstantlyCampaign, senderEmail: string, verifiedAccountTagIds?: string[]): InstantlySenderRemovalPlan {
   const exact = inputEmail(senderEmail);
   if (!Array.isArray(campaign.email_list) || campaign.email_list.length > 10_000
     || campaign.email_list.some(email => typeof email !== "string" || inputEmail(email) !== email.toLowerCase())
     || new Set(campaign.email_list.map(email => email.toLowerCase())).size !== campaign.email_list.length) {
     blocked("Campaign sender assignments are incomplete or ambiguous.");
   }
-  if (campaign.email_tag_list !== undefined && (!Array.isArray(campaign.email_tag_list) || campaign.email_tag_list.length)) {
-    blocked("Tag-based sender assignments require separate review; removing a direct assignment would not reserve the mailbox.");
+  if (campaign.email_tag_list !== undefined && !Array.isArray(campaign.email_tag_list)) blocked("Campaign tag assignments are ambiguous.");
+  if (campaign.email_tag_list?.length && (!verifiedAccountTagIds || campaign.email_tag_list.some(id => verifiedAccountTagIds.includes(id)))) {
+    blocked("Tag-based sender assignments must be removed from this mailbox first; campaign tag lists must remain unchanged.");
   }
   const before = [...campaign.email_list];
   const after = before.filter(email => email.toLowerCase() !== exact);
@@ -315,6 +322,21 @@ export function planInstantlySenderRemoval(campaign: ManagedInstantlyCampaign, s
     before, after, alreadyAbsent: before.length === after.length,
     fingerprint: createHash("sha256").update(canonicalJson({ id: campaign.id, name: campaign.name, status: campaign.status,
       email_list: before, email_tag_list: campaign.email_tag_list ?? [] })).digest("hex") };
+}
+
+export function planInstantlyAccountTagRemoval(campaign: ManagedInstantlyCampaign, senderEmail: string, mappings: InstantlyAccountTagMapping[]): InstantlyAccountTagRemovalPlan {
+  const exact = inputEmail(senderEmail);
+  if (!Array.isArray(campaign.email_tag_list) || campaign.email_tag_list.some(id => typeof id !== "string" || !id)
+    || new Set(campaign.email_tag_list).size !== campaign.email_tag_list.length) blocked("Exact campaign tag assignments are required.");
+  if (!Array.isArray(mappings) || mappings.some(row => row.resource_type !== 1 || row.resource_id.toLowerCase() !== exact || !row.id || !row.tag_id)
+    || new Set(mappings.map(row => row.tag_id)).size !== mappings.length) blocked("Exact account tag mappings are required.");
+  const before = [...mappings].sort((a, b) => a.tag_id.localeCompare(b.tag_id));
+  const campaignTagIds = [...campaign.email_tag_list].sort();
+  const removeTagIds = before.filter(row => campaignTagIds.includes(row.tag_id)).map(row => row.tag_id);
+  const after = before.filter(row => !removeTagIds.includes(row.tag_id));
+  return { campaignId: campaign.id, campaignName: campaign.name, senderEmail: exact, campaignTagIds, before, after, removeTagIds,
+    alreadyAbsent: removeTagIds.length === 0,
+    fingerprint: createHash("sha256").update(canonicalJson({ campaignId: campaign.id, senderEmail: exact, campaignTagIds, before })).digest("hex") };
 }
 
 function textToHtml(value: string): string {
@@ -501,25 +523,68 @@ export function createManagedInstantlyClient(apiKey: string, options: {
         timestamp_created: timestamp(row.timestamp_created), status: numeric(row.status) };
     }), { query: { limit: "100", starting_after: cursor } }));
   }
+  function listAccountTagMappings(email: string) {
+    const exact = inputEmail(email);
+    return allPages(cursor => request("GET", "/custom-tag-mappings", value => page(value, item => {
+      const row = object(item);
+      if (row.resource_type !== 1 || string(row.resource_id).toLowerCase() !== exact) throw new Error("Unexpected tag resource");
+      return { id: string(row.id), tag_id: string(row.tag_id), resource_id: exact, resource_type: 1 as const };
+    }), { query: { limit: "100", starting_after: cursor, resource_ids: exact } }));
+  }
+  async function getSenderRemovalPlan(campaignId: string, senderEmail: string) {
+    const campaign = await getCampaign(campaignId);
+    if (campaign.id !== campaignId) blocked("Unexpected provider campaign identity.");
+    const tagIds = campaign.email_tag_list?.length ? (await listAccountTagMappings(senderEmail)).map(row => row.tag_id) : undefined;
+    return planInstantlySenderRemoval(campaign, senderEmail, tagIds);
+  }
+  async function getAccountTagRemovalPlan(campaignId: string, senderEmail: string) {
+    const [campaign, mappings] = await Promise.all([getCampaign(campaignId), listAccountTagMappings(senderEmail)]);
+    if (campaign.id !== campaignId) blocked("Unexpected provider campaign identity.");
+    return planInstantlyAccountTagRemoval(campaign, senderEmail, mappings);
+  }
+  async function removeAccountTagsForCampaign(campaignId: string, senderEmail: string, expectedFingerprint: string,
+    beforeMutation: (plan: InstantlyAccountTagRemovalPlan) => Promise<void>) {
+    if (!/^[a-f0-9]{64}$/.test(expectedFingerprint) || typeof beforeMutation !== "function") invalid("A saved exact account-tag plan and durable audit callback are required.");
+    const plan = await getAccountTagRemovalPlan(campaignId, senderEmail);
+    if (plan.fingerprint !== expectedFingerprint) blocked("Account or campaign tags changed; read a fresh removal plan.");
+    if (plan.alreadyAbsent) return { ...plan, outcome: "already_absent" as const, checkedAt: new Date().toISOString() };
+    await beforeMutation(plan);
+    if ((await getAccountTagRemovalPlan(campaignId, senderEmail)).fingerprint !== expectedFingerprint) blocked("Tag assignments changed before removal; no mutation requested.");
+    let mutationAccepted = false;
+    try {
+      await request("POST", "/custom-tags/toggle-resource", value => {
+        if (object(value).success !== true) throw new Error("Unconfirmed tag removal");
+        return true;
+      }, { mutation: true, body: { tag_ids: plan.removeTagIds, resource_type: 1, resource_ids: [plan.senderEmail], selected_all: false, assign: false } });
+      mutationAccepted = true;
+      const confirmed = await getAccountTagRemovalPlan(campaignId, senderEmail);
+      if (canonicalJson(confirmed.before) !== canonicalJson(plan.after) || canonicalJson(confirmed.campaignTagIds) !== canonicalJson(plan.campaignTagIds)) {
+        throw new ManagedInstantlyError("Exact account-tag removal was not confirmed; inspect provider state before retrying.", { code: "invalid_response", outcomeUnknown: true });
+      }
+      return { ...plan, outcome: "removed" as const, checkedAt: new Date().toISOString() };
+    } catch (error) {
+      if (error instanceof ManagedInstantlyError && !mutationAccepted) throw error;
+      throw new ManagedInstantlyError("Account-tag removal may have been applied; reconcile saved evidence before retrying.", {
+        code: error instanceof ManagedInstantlyError ? error.code : "provider_error", outcomeUnknown: true, providerId: campaignId,
+      });
+    }
+  }
   async function removeSenderFromCampaign(campaignId: string, senderEmail: string, expectedFingerprint: string,
     beforeMutation: (plan: InstantlySenderRemovalPlan) => Promise<void>) {
     if (!/^[a-f0-9]{64}$/.test(expectedFingerprint) || typeof beforeMutation !== "function") invalid("A saved exact removal plan and durable audit callback are required.");
-    const campaign = await getCampaign(campaignId);
-    if (campaign.id !== campaignId) blocked("Campaign identity did not match the requested provider ID.");
-    const plan = planInstantlySenderRemoval(campaign, senderEmail);
+    const plan = await getSenderRemovalPlan(campaignId, senderEmail);
     if (plan.fingerprint !== expectedFingerprint) blocked("Campaign assignments changed since review; fetch a fresh removal plan.");
     if (plan.alreadyAbsent) return { ...plan, outcome: "already_absent" as const, checkedAt: new Date().toISOString() };
     await beforeMutation(plan); // Fail closed if the attempted mutation cannot be saved.
     // Re-read AFTER saving the intent. Do not apply a stale sender-array snapshot.
-    const latest = await getCampaign(campaignId);
-    if (planInstantlySenderRemoval(latest, senderEmail).fingerprint !== expectedFingerprint) blocked("Campaign assignments changed before removal; no PATCH was requested.");
+    const latest = await getSenderRemovalPlan(campaignId, senderEmail);
+    if (latest.fingerprint !== expectedFingerprint) blocked("Campaign assignments changed before removal; no PATCH was requested.");
     let patchAccepted = false;
     try {
       await request("PATCH", `/campaigns/${inputId(campaignId)}`, parseCampaign, { mutation: true, body: { email_list: plan.after } });
       patchAccepted = true;
-      const confirmed = await getCampaign(campaignId);
-      const observed = planInstantlySenderRemoval(confirmed, senderEmail);
-      if (confirmed.id !== campaignId || confirmed.status !== latest.status || confirmed.name !== latest.name
+      const observed = await getSenderRemovalPlan(campaignId, senderEmail);
+      if (observed.campaignId !== campaignId || observed.status !== latest.status || observed.campaignName !== latest.campaignName
         || canonicalJson(observed.before) !== canonicalJson(plan.after)) throw new ManagedInstantlyError("Sender removal was not confirmed exactly; inspect provider state before retrying.", { code: "invalid_response", outcomeUnknown: true });
       return { ...plan, outcome: "removed" as const, checkedAt: new Date().toISOString() };
     } catch (error) {
@@ -835,6 +900,10 @@ export function createManagedInstantlyClient(apiKey: string, options: {
     },
     getCampaign,
     listAccountCampaigns,
+    listAccountTagMappings,
+    getSenderRemovalPlan,
+    getAccountTagRemovalPlan,
+    removeAccountTagsForCampaign,
     removeSenderFromCampaign,
     pauseCampaign,
     listCampaignLeads,
