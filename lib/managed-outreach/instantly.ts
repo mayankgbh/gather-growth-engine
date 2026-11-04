@@ -1,18 +1,23 @@
 /**
- * Restricted Instantly API v2 adapter. Only explicit activateCampaign queues mail.
+ * Restricted Instantly API v2 adapter. Only explicit activation calls queue mail.
  * Official references (reviewed 2026-11-04):
  * https://developer.instantly.ai/api-reference/groups/email
  * https://developer.instantly.ai/api-reference/email/list-email
  * https://developer.instantly.ai/api-reference/campaign/create-campaign
  * https://developer.instantly.ai/api-reference/lead/add-leads-in-bulk-to-a-campaign-or-list
+ * https://developer.instantly.ai/api-reference/campaign/patch-campaign
+ * https://help.instantly.ai/en/articles/13924383-how-to-add-new-steps-to-an-active-campaign
  *
  * Campaign activation queues provider work, rather than synchronously sending one
  * message. It cannot enforce a fresh external CRM check at actual send time.
  * There is no documented first-touch send endpoint. /emails/reply requires an
  * existing message and defaults to that message's sender; /emails/test is not a
  * production-send workaround. Activation is the controlled dispatch boundary,
- * not a promise about SMTP execution time. Unanswered followups remain gated.
+ * not a promise about SMTP execution time. Followups use the documented native
+ * pause/append/resume workflow, with only one unsent step present at a time.
  */
+
+import { createHash } from "crypto";
 
 const API_BASE = "https://api.instantly.ai/api/v2";
 type JsonObject = Record<string, unknown>;
@@ -29,6 +34,8 @@ export const INSTANTLY_MANAGED_CAPABILITIES = Object.freeze({
   guaranteedThreadedUnansweredFollowup: false,
   documentedMutationIdempotencyKey: false,
   guardedSingleRecipientActivation: true,
+  documentedNativeThreadedFollowup: true,
+  guardedIncrementalFollowup: true,
   sendBoundaryLimitation: "Instantly campaign activation queues asynchronous sends; fresh external exclusions are checked before dispatch, not again at provider SMTP execution. Direct first-touch sending is not documented.",
 });
 
@@ -37,11 +44,13 @@ export class ManagedInstantlyError extends Error {
   readonly outcomeUnknown: boolean;
   readonly status?: number;
   readonly providerId?: string;
+  readonly expectedSequenceFingerprint?: string;
   constructor(message: string, options: {
     code: ManagedInstantlyError["code"];
     outcomeUnknown?: boolean;
     status?: number;
     providerId?: string;
+    expectedSequenceFingerprint?: string;
   }) {
     super(message);
     this.name = "ManagedInstantlyError";
@@ -49,6 +58,7 @@ export class ManagedInstantlyError extends Error {
     this.outcomeUnknown = options.outcomeUnknown ?? false;
     this.status = options.status;
     this.providerId = options.providerId;
+    this.expectedSequenceFingerprint = options.expectedSequenceFingerprint;
   }
 }
 
@@ -60,6 +70,7 @@ export type ManagedInstantlyAccount = {
   daily_limit?: number | null;
   stat_warmup_score?: number | null;
   timestamp_created?: string;
+  timestamp_warmup_start?: string | null;
 };
 export type ManagedInstantlyCampaign = {
   id: string;
@@ -69,7 +80,14 @@ export type ManagedInstantlyCampaign = {
   stop_on_reply?: boolean | null;
   stop_on_auto_reply?: boolean | null;
   stop_for_company?: boolean | null;
-  sequences?: Array<{ steps: Array<{ type: string; variants: Array<{ subject: string; body: string }> }> }>;
+  sequences?: InstantlySequence[];
+};
+export type InstantlySequence = { steps: InstantlySequenceStep[] };
+export type InstantlySequenceStep = {
+  type: string;
+  delay?: number;
+  delay_unit?: "days" | "hours" | "minutes";
+  variants: Array<{ subject: string; body: string; v_disabled?: boolean }>;
 };
 export type ManagedInstantlyLead = {
   id: string;
@@ -80,6 +98,9 @@ export type ManagedInstantlyLead = {
   lt_interest_status?: number;
   timestamp_last_contact?: string | null;
   timestamp_last_reply?: string | null;
+  last_step_from?: string | null;
+  last_step_id?: string | null;
+  status_summary?: { lastStep?: { from?: string; stepID?: string; timestamp_executed?: string } };
 };
 export type ManagedInstantlyEmail = {
   id: string;
@@ -90,6 +111,8 @@ export type ManagedInstantlyEmail = {
   eaccount: string;
   from_address_email?: string | null;
   to_address_email_list: string;
+  cc_address_email_list?: string | null;
+  bcc_address_email_list?: string | null;
   body: { text?: string; html?: string };
   campaign_id?: string | null;
   lead?: string | null;
@@ -125,7 +148,9 @@ export type PausedCampaignInput = {
   senderEmails: string[];
   subject: string;
   bodyText: string;
-  timezone?: "America/Detroit" | "America/Chicago" | "America/Boise" | "America/Dawson";
+  timezone?: "America/Detroit" | "America/Chicago" | "America/Boise" | "America/Dawson" | "America/Anchorage" | "America/Creston" | "Etc/GMT+10";
+  /** Explicit supported-zone hours; caller may convert verified recipient-local hours. */
+  timing?: { from: string; to: string };
 };
 export type VerifiedLeadInput = {
   email: string;
@@ -144,6 +169,105 @@ export type LeadUploadResult = {
   invalid_email_count: number;
   created_leads: Array<{ id: string; index: number; email?: string | null }>;
 };
+export type InstantlyFollowupProof = {
+  expectedRecipientEmail: string;
+  expectedSenderEmail: string;
+  expectedThreadId: string;
+  /** Complete immutable sent-email IDs, in chronological step order, from our ledger. */
+  priorSentEmailIds: string[];
+  expectedSequenceFingerprint: string;
+};
+export type AppendInstantlyStepInput = InstantlyFollowupProof & {
+  bodyText: string;
+  /** Native delay from the preceding step's actual send, not from append time. */
+  delayDays: number;
+};
+export type InstantlyFollowupPlan = {
+  sequences: InstantlySequence[];
+  sequenceFingerprint: string;
+  nextStep: number;
+};
+export type InstantlyAccountHealth = {
+  observedAt: string;
+  account: ManagedInstantlyAccount;
+  campaign: {
+    requestedWindow: { startDate: string; endDate: string };
+    daily: Array<{ date: string; sent: number; bounced: number; replies?: number }>;
+    observedDates: string[];
+    missingDates: string[];
+    completeWindow: boolean;
+    sent: number | null;
+    bounced: number | null;
+    bounceRatio: number | null;
+  };
+  warmup: {
+    dailyObserved: Array<{ date: string; sent: number | null; received: number | null; landed_inbox: number | null; landed_spam: number | null }>;
+    aggregate: { sent: number | null; received: number | null; landed_inbox: number | null; landed_spam: number | null; health_score: number | null; health_score_label: string | null } | null;
+    scope: "warmup_only";
+    aggregateWindow: "provider_defined_not_requested_window";
+  };
+  complaints: { status: "not_exposed_by_reviewed_endpoints" };
+  authentication: { status: "not_checked" };
+  sources: string[];
+};
+
+function blocked(message: string): never {
+  throw new ManagedInstantlyError(message, { code: "launch_blocked" });
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  const obj = value as JsonObject;
+  return `{${Object.keys(obj).filter(key => obj[key] !== undefined).sort()
+    .map(key => `${JSON.stringify(key)}:${canonicalJson(obj[key])}`).join(",")}}`;
+}
+
+function validatedFollowupSequences(campaign: ManagedInstantlyCampaign): InstantlySequence[] {
+  const sequences = campaign.sequences;
+  if (!Array.isArray(sequences) || sequences.length !== 1 || !Array.isArray(sequences[0].steps)
+    || sequences[0].steps.length < 1 || sequences[0].steps.length > 5
+    || Object.keys(sequences[0]).some(key => key !== "steps")) blocked("A single managed sequence of at most five steps is required.");
+  sequences[0].steps.forEach((step, index) => {
+    if (!step || Object.keys(step).some(key => !["type", "delay", "delay_unit", "variants"].includes(key))
+      || step.type !== "email" || !Number.isInteger(step.delay) || Number(step.delay) < 0 || Number(step.delay) > 366
+      || (step.delay_unit !== undefined && step.delay_unit !== "days")
+      || !Array.isArray(step.variants) || step.variants.length !== 1) blocked("Unexpected sequence shape or timing; hold for review.");
+    const variant = step.variants[0];
+    if (!variant || Object.keys(variant).some(key => !["subject", "body", "v_disabled"].includes(key))
+      || typeof variant.subject !== "string" || typeof variant.body !== "string" || !variant.body.trim()
+      || (index === 0 ? !variant.subject.trim() : variant.subject !== "")
+      || (variant.v_disabled !== undefined && variant.v_disabled !== false)) blocked("Managed followups require one enabled variant and a blank followup subject.");
+  });
+  return sequences;
+}
+
+/** Persist this fingerprint with the managed dispatch; never silently adopt edits from the provider. */
+export function fingerprintCampaignSequence(campaign: ManagedInstantlyCampaign): string {
+  const sequences = validatedFollowupSequences(campaign);
+  return createHash("sha256").update(canonicalJson(sequences)).digest("hex");
+}
+
+/** Pure plan: callers can persist the intended new fingerprint BEFORE a provider mutation. */
+export function planInstantlyFollowup(campaign: ManagedInstantlyCampaign, input: {
+  expectedSequenceFingerprint: string; bodyText: string; delayDays: number;
+}): InstantlyFollowupPlan {
+  if (fingerprintCampaignSequence(campaign) !== input.expectedSequenceFingerprint) blocked("The provider sequence changed; do not append to an unrecognized sequence.");
+  if (typeof input.bodyText !== "string" || !input.bodyText.trim()) invalid("Followup text is required.");
+  if (!Number.isInteger(input.delayDays) || input.delayDays < 1 || input.delayDays > 30) invalid("A followup interval of 1–30 days is required.");
+  const sequences = JSON.parse(JSON.stringify(campaign.sequences)) as InstantlySequence[];
+  const steps = sequences[0].steps;
+  if (steps.length >= 5) blocked("The managed sequence already contains all five steps.");
+  // The only change to a completed step is its documented wait before NEXT email.
+  steps[steps.length - 1].delay = input.delayDays;
+  steps[steps.length - 1].delay_unit = "days";
+  steps.push({ type: "email", delay: 0, delay_unit: "days", variants: [{ subject: "", body: textToHtml(input.bodyText) }] });
+  return { sequences, sequenceFingerprint: fingerprintCampaignSequence({ ...campaign, sequences }), nextStep: steps.length };
+}
+
+function textToHtml(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\r?\n/g, "<br/>");
+}
 
 function invalid(message: string): never {
   throw new ManagedInstantlyError(message, { code: "invalid_input" });
@@ -159,6 +283,31 @@ function string(value: unknown): string {
 function numeric(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value)) throw new Error("Expected number");
   return value;
+}
+function count(value: unknown): number {
+  const n = numeric(value);
+  if (!Number.isInteger(n) || n < 0) throw new Error("Invalid nonnegative count");
+  return n;
+}
+function optionalCount(value: unknown): number | null { return value == null ? null : count(value); }
+function isoDate(value: unknown): string {
+  const date = string(value);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(date))
+    || new Date(date).toISOString().slice(0, 10) !== date) throw new Error("Invalid calendar date");
+  return date;
+}
+function parseAccount(value: unknown): ManagedInstantlyAccount {
+  const a = object(value); string(a.email); numeric(a.warmup_status);
+  if (typeof a.setup_pending !== "boolean") throw new Error("Missing setup status");
+  if (a.status !== undefined) numeric(a.status);
+  if (a.daily_limit != null) count(a.daily_limit);
+  if (a.stat_warmup_score != null) numeric(a.stat_warmup_score);
+  if (a.timestamp_created != null) timestamp(a.timestamp_created);
+  if (a.timestamp_warmup_start != null) timestamp(a.timestamp_warmup_start);
+  // Deliberately omit signatures, ownership, status text and SMTP configuration.
+  return { email: a.email, warmup_status: a.warmup_status, setup_pending: a.setup_pending,
+    status: a.status, daily_limit: a.daily_limit, stat_warmup_score: a.stat_warmup_score,
+    timestamp_created: a.timestamp_created, timestamp_warmup_start: a.timestamp_warmup_start } as ManagedInstantlyAccount;
 }
 function inputEmail(value: string): string {
   if (typeof value !== "string" || !/^[^\s<>@,]+@[^\s<>@,]+\.[^\s<>@,]+$/.test(value)) invalid("An exact valid email address is required.");
@@ -221,7 +370,7 @@ export function createManagedInstantlyClient(apiKey: string, options: {
   if (!Number.isInteger(maxPages) || maxPages < 1 || maxPages > 1000) invalid("Invalid page budget.");
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 60_000) invalid("Invalid timeout.");
 
-  async function request<T>(method: "GET" | "POST", path: string, parse: (value: unknown) => T, args: {
+  async function request<T>(method: "GET" | "POST" | "PATCH", path: string, parse: (value: unknown) => T, args: {
     body?: unknown; query?: Record<string, string | undefined>; mutation?: boolean;
   } = {}): Promise<T> {
     const controller = new AbortController();
@@ -292,6 +441,71 @@ export function createManagedInstantlyClient(apiKey: string, options: {
   function getCampaign(id: string) {
     return request("GET", `/campaigns/${inputId(id)}`, parseCampaign);
   }
+  async function getAccountHealth(email: string, window: { startDate: string; endDate: string }): Promise<InstantlyAccountHealth> {
+    const exact = inputEmail(email);
+    let startDate: string; let endDate: string;
+    try { startDate = isoDate(window.startDate); endDate = isoDate(window.endDate); }
+    catch { invalid("Account health requires valid YYYY-MM-DD dates."); }
+    const dayCount = (Date.parse(endDate) - Date.parse(startDate)) / 86_400_000 + 1;
+    if (!Number.isInteger(dayCount) || dayCount < 1 || dayCount > 31) invalid("Account health requires a window of 1–31 calendar days.");
+    const requestedDates = Array.from({ length: dayCount }, (_, offset) => new Date(Date.parse(startDate) + offset * 86_400_000).toISOString().slice(0, 10));
+    const [account, daily, warmup] = await Promise.all([
+      request("GET", `/accounts/${encodeURIComponent(exact)}`, value => {
+        const result = parseAccount(value);
+        if (result.email.toLowerCase() !== exact) throw new Error("Wrong account");
+        return result;
+      }),
+      request("GET", "/accounts/analytics/daily", value => {
+        if (!Array.isArray(value)) throw new Error("Missing daily analytics");
+        const seen = new Set<string>();
+        return value.map(item => {
+          const row = object(item); const date = isoDate(row.date);
+          if (string(row.email_account).toLowerCase() !== exact || date < startDate || date > endDate || seen.has(date)) throw new Error("Unexpected daily analytics row");
+          seen.add(date);
+          return { date, sent: count(row.sent), bounced: count(row.bounced), ...(row.replies == null ? {} : { replies: count(row.replies) }) };
+        }).sort((a, b) => a.date.localeCompare(b.date));
+      }, { query: { emails: exact, start_date: startDate, end_date: endDate } }),
+      // A read-scoped analytics POST; this does not enable warmup or buy accounts.
+      request("POST", "/accounts/warmup-analytics", value => {
+        const v = object(value);
+        const emailDates = object(v.email_date_data);
+        const aggregates = object(v.aggregate_data);
+        for (const map of [emailDates, aggregates]) {
+          if (Object.keys(map).length > 1 || Object.keys(map).some(key => key.toLowerCase() !== exact)) throw new Error("Unexpected warmup account");
+        }
+        const datesKey = Object.keys(emailDates)[0];
+        const aggregateKey = Object.keys(aggregates)[0];
+        const dates = datesKey ? object(emailDates[datesKey]) : {};
+        const dailyObserved = Object.keys(dates).map(key => {
+          const date = isoDate(key); const row = object(dates[key]);
+          return { date, sent: optionalCount(row.sent), received: optionalCount(row.received), landed_inbox: optionalCount(row.landed_inbox), landed_spam: optionalCount(row.landed_spam) };
+        }).filter(row => row.date >= startDate && row.date <= endDate).sort((a, b) => a.date.localeCompare(b.date));
+        const aggregateRow = aggregateKey ? object(aggregates[aggregateKey]) : null;
+        const healthScore = aggregateRow?.health_score == null ? null : numeric(aggregateRow.health_score);
+        if (healthScore !== null && (healthScore < 0 || healthScore > 100)) throw new Error("Invalid warmup score");
+        if (aggregateRow?.health_score_label != null && typeof aggregateRow.health_score_label !== "string") throw new Error("Invalid warmup label");
+        const aggregate = aggregateRow ? {
+          sent: optionalCount(aggregateRow.sent), received: optionalCount(aggregateRow.received),
+          landed_inbox: optionalCount(aggregateRow.landed_inbox), landed_spam: optionalCount(aggregateRow.landed_spam),
+          health_score: healthScore, health_score_label: (aggregateRow.health_score_label as string | null | undefined) ?? null,
+        } : null;
+        return { dailyObserved, aggregate, scope: "warmup_only" as const, aggregateWindow: "provider_defined_not_requested_window" as const };
+      }, { mutation: false, body: { emails: [exact] } }),
+    ]);
+    const observedDates = daily.map(row => row.date);
+    const missingDates = requestedDates.filter(date => !observedDates.includes(date));
+    const sent = daily.length ? daily.reduce((sum, row) => sum + row.sent, 0) : null;
+    const bounced = daily.length ? daily.reduce((sum, row) => sum + row.bounced, 0) : null;
+    return { observedAt: new Date().toISOString(), account,
+      campaign: { requestedWindow: { startDate, endDate }, daily, observedDates, missingDates,
+        completeWindow: missingDates.length === 0, sent, bounced, bounceRatio: sent && bounced !== null ? bounced / sent : null },
+      warmup, complaints: { status: "not_exposed_by_reviewed_endpoints" }, authentication: { status: "not_checked" },
+      sources: ["https://developer.instantly.ai/api-reference/account/get-account",
+        "https://developer.instantly.ai/api-reference/account/get-daily-account-analytics",
+        "https://developer.instantly.ai/api-reference/account/get-warmup-analytics",
+        "https://help.instantly.ai/en/articles/13939939-warmup-health-score"],
+    };
+  }
   async function pauseCampaign(id: string) {
     const result = await request("POST", `/campaigns/${inputId(id)}/pause`, parseCampaign, { mutation: true, body: {} });
     if (result.id !== id || ![0, 2, 3].includes(result.status)) throw new ManagedInstantlyError("Campaign pause was not confirmed.", {
@@ -325,20 +539,176 @@ export function createManagedInstantlyClient(apiKey: string, options: {
     if (emails.some(email => email.ue_type !== 2)) throw new ManagedInstantlyError("Inbound scan included an unconfirmed email direction.", { code: "invalid_response" });
     return emails;
   }
+  function getEmail(id: string) {
+    return request("GET", `/emails/${inputId(id)}`, value => {
+      const email = parseEmail(value);
+      if (email.id !== id) throw new Error("Wrong email receipt");
+      return email;
+    });
+  }
+  function assertFreshPreflight(checkedAt: string) {
+    const at = Date.parse(checkedAt);
+    if (!Number.isFinite(at) || at > Date.now() || Date.now() - at > 60_000) blocked("Fresh external exclusions and eligibility checks are required immediately before dispatch.");
+  }
+  function validateFollowupProof(proof: InstantlyFollowupProof) {
+    const sender = inputEmail(proof.expectedSenderEmail);
+    const recipient = inputEmail(proof.expectedRecipientEmail);
+    inputId(proof.expectedThreadId);
+    if (sender === recipient || !Array.isArray(proof.priorSentEmailIds) || proof.priorSentEmailIds.length < 1
+      || proof.priorSentEmailIds.length > 4 || new Set(proof.priorSentEmailIds).size !== proof.priorSentEmailIds.length
+      || !/^[a-f0-9]{64}$/.test(proof.expectedSequenceFingerprint)) invalid("Complete unique prior sent IDs, thread and sequence fingerprint are required for a followup.");
+    proof.priorSentEmailIds.forEach(inputId);
+    return { sender, recipient };
+  }
+  function assertFollowupCampaign(campaign: ManagedInstantlyCampaign, campaignId: string, proof: InstantlyFollowupProof, expectedSteps: number) {
+    const { sender } = validateFollowupProof(proof);
+    if (campaign.id !== campaignId || ![2, 3].includes(campaign.status)
+      || campaign.stop_on_reply !== true || campaign.stop_on_auto_reply !== true || campaign.stop_for_company !== true
+      || campaign.email_list?.length !== 1 || campaign.email_list[0].toLowerCase() !== sender
+      || fingerprintCampaignSequence(campaign) !== proof.expectedSequenceFingerprint
+      || campaign.sequences![0].steps.length !== expectedSteps) {
+      blocked("Followup campaign identity, sequence, progress or stop-on-reply protections do not match the saved evidence.");
+    }
+  }
+  async function verifyFollowupHistory(campaign: ManagedInstantlyCampaign, proof: InstantlyFollowupProof, requireCompleted: boolean) {
+    const { sender, recipient } = validateFollowupProof(proof);
+    const leads = await listCampaignLeads(campaign.id);
+    const candidate = leads[0];
+    if (leads.length !== 1 || candidate.email?.toLowerCase() !== recipient || candidate.campaign !== campaign.id
+      || !(requireCompleted ? [3] : [1, 3]).includes(candidate.status) || candidate.email_reply_count !== 0
+      || candidate.timestamp_last_reply || candidate.lt_interest_status != null) {
+      blocked("The previous sequence must be completed by exactly one recipient, without replies, pause labels, bounces or other stop states.");
+    }
+    // Fetch ALL campaign mail, not just a latest-thread preview or a sent-only list.
+    // Unexpected manual, inbound or scheduled mail prevents a new dispatch.
+    const history = await allPages(cursor => listEmailsPage({ campaignId: campaign.id }, cursor));
+    if (history.length !== proof.priorSentEmailIds.length || new Set(history.map(email => email.id)).size !== history.length
+      || history.some(email => email.ue_type !== 1 || !proof.priorSentEmailIds.includes(email.id))) {
+      blocked("Campaign mail history does not exactly match the immutable completed-step ledger.");
+    }
+    // Catch responses from a different address that have not been attached to the
+    // original lead/campaign yet. Thread identity, not inferred sender, stops us.
+    const threadHistory = await allPages(cursor => listEmailsPage({ threadId: proof.expectedThreadId }, cursor));
+    if (threadHistory.length !== proof.priorSentEmailIds.length
+      || new Set(threadHistory.map(email => email.id)).size !== threadHistory.length
+      || threadHistory.some(email => email.ue_type !== 1 || email.thread_id !== proof.expectedThreadId || !proof.priorSentEmailIds.includes(email.id))) {
+      blocked("Thread history includes a reply, pending mail or unrecognized activity; hold the sequence.");
+    }
+    const messages = await Promise.all(proof.priorSentEmailIds.map(id => getEmail(id)));
+    const firstSubject = campaign.sequences![0].steps[0].variants[0].subject;
+    const rfcIds = new Set<string>();
+    let previousTime = -Infinity;
+    for (let index = 0; index < messages.length; index++) {
+      const email = messages[index];
+      const sentAt = Date.parse(email.timestamp_email);
+      // Unibox's opaque step field is never treated as an invented numeric index.
+      if (email.ue_type !== 1 || email.campaign_id !== campaign.id || email.lead_id !== candidate.id
+        || email.lead?.toLowerCase() !== recipient || email.eaccount.toLowerCase() !== sender
+        || email.from_address_email?.toLowerCase() !== sender || email.to_address_email_list.toLowerCase() !== recipient
+        || email.cc_address_email_list?.trim() || email.bcc_address_email_list?.trim()
+        || email.thread_id !== proof.expectedThreadId || email.body_fallback_reason
+        || (!email.body.text?.trim() && !email.body.html?.trim()) || rfcIds.has(email.message_id)
+        || sentAt <= previousTime || sentAt > Date.now() + 300_000
+        || Date.parse(email.timestamp_created) > Date.now() + 300_000
+        || (index === 0 ? email.subject !== firstSubject : email.subject.replace(/^(?:re:\s*)+/i, "") !== firstSubject)) {
+        blocked("Prior outbound evidence failed exact sender, recipient, thread, subject, chronology or message validation.");
+      }
+      const listed = history.find(item => item.id === email.id)!;
+      if (listed.message_id !== email.message_id || listed.timestamp_email !== email.timestamp_email
+        || listed.campaign_id !== email.campaign_id || listed.thread_id !== email.thread_id) {
+        blocked("Provider list and immutable message evidence disagree; reconcile before following up.");
+      }
+      rfcIds.add(email.message_id);
+      previousTime = sentAt;
+    }
+    const previous = messages[messages.length - 1];
+    const lastContact = Date.parse(candidate.timestamp_last_contact ?? "");
+    if (!Number.isFinite(lastContact) || Math.abs(lastContact - Date.parse(previous.timestamp_email)) > 300_000) {
+      blocked("Lead progress does not match the newest proven outbound message.");
+    }
+    const progress = candidate.status_summary?.lastStep;
+    if ((candidate.last_step_from != null && candidate.last_step_from !== "campaign")
+      || (progress?.from != null && progress.from !== "campaign")
+      || [candidate.last_step_id, progress?.stepID].some(id => id != null && (!previous.step || id !== previous.step))
+      || (progress?.timestamp_executed != null && (!Number.isFinite(Date.parse(progress.timestamp_executed))
+        || Math.abs(Date.parse(progress.timestamp_executed) - Date.parse(previous.timestamp_email)) > 300_000))) {
+      blocked("Provider lead progress refers to a different step or execution.");
+    }
+    if (await isSuppressed(recipient)) blocked("Recipient is on the provider blocklist.");
+    if ((await listInboundEmails({ leadEmail: recipient })).length) blocked("Incoming mail exists for this recipient; hold all further sequence steps.");
+    return { previous, candidate };
+  }
+
+  async function appendNextStep(campaignId: string, input: AppendInstantlyStepInput) {
+    validateFollowupProof(input);
+    const campaign = await getCampaign(campaignId);
+    assertFollowupCampaign(campaign, campaignId, input, input.priorSentEmailIds.length);
+    const plan = planInstantlyFollowup(campaign, input);
+    await verifyFollowupHistory(campaign, input, true);
+    try {
+      // The documented edit workflow explicitly pauses before adding a step.
+      await pauseCampaign(campaignId);
+      const paused = await getCampaign(campaignId);
+      assertFollowupCampaign(paused, campaignId, input, input.priorSentEmailIds.length);
+      const staged = await request("PATCH", `/campaigns/${inputId(campaignId)}`, parseCampaign, {
+        mutation: true, body: { sequences: plan.sequences },
+      });
+      let stagedFingerprint: string;
+      try { stagedFingerprint = fingerprintCampaignSequence(staged); }
+      catch { throw new ManagedInstantlyError("Followup patch response is incomplete; reconcile the known campaign.", { code: "invalid_response", outcomeUnknown: true }); }
+      if (staged.id !== campaignId || ![2, 3].includes(staged.status)
+        || stagedFingerprint !== plan.sequenceFingerprint
+        || staged.email_list?.length !== 1 || staged.email_list[0].toLowerCase() !== input.expectedSenderEmail.toLowerCase()
+        || staged.stop_on_reply !== true || staged.stop_on_auto_reply !== true || staged.stop_for_company !== true) {
+        throw new ManagedInstantlyError("Followup patch was not confirmed exactly as planned.", { code: "invalid_response", outcomeUnknown: true });
+      }
+      return { campaign: staged, sequenceFingerprint: plan.sequenceFingerprint, nextStep: plan.nextStep,
+        priorSentEmailIds: [...input.priorSentEmailIds], threadId: input.expectedThreadId };
+    } catch (error) {
+      if (error instanceof ManagedInstantlyError && error.outcomeUnknown) {
+        try { await pauseCampaign(campaignId); } catch { /* Pausing cannot undo prior sends. */ }
+        throw new ManagedInstantlyError("Followup staging is uncertain. Pause was attempted; compare the saved intended fingerprint before retrying any mutation.", {
+          code: error.code, status: error.status, outcomeUnknown: true, providerId: campaignId,
+          expectedSequenceFingerprint: plan.sequenceFingerprint,
+        });
+      }
+      throw error;
+    }
+  }
+
+  async function activateNextStep(campaignId: string, proof: InstantlyFollowupProof & { preflightCheckedAt: string }) {
+    assertFreshPreflight(proof.preflightCheckedAt);
+    validateFollowupProof(proof);
+    const campaign = await getCampaign(campaignId);
+    assertFollowupCampaign(campaign, campaignId, proof, proof.priorSentEmailIds.length + 1);
+    const { previous } = await verifyFollowupHistory(campaign, proof, false);
+    const priorStep = campaign.sequences![0].steps[proof.priorSentEmailIds.length - 1];
+    const delay = Number(priorStep.delay);
+    if (!Number.isInteger(delay) || delay < 1 || delay > 30
+      || Date.now() < Date.parse(previous.timestamp_email) + delay * 86_400_000) blocked("The next followup is not due relative to the previous actual send.");
+    assertFreshPreflight(proof.preflightCheckedAt);
+    try {
+      const active = await request("POST", `/campaigns/${inputId(campaignId)}/activate`, parseCampaign, { mutation: true, body: {} });
+      if (active.id !== campaignId || active.status !== 1) throw new ManagedInstantlyError("Followup activation was not confirmed.", { code: "invalid_response", outcomeUnknown: true });
+      return active; // Native queued execution; only a later immutable email proves sent.
+    } catch (error) {
+      if (error instanceof ManagedInstantlyError && error.outcomeUnknown) {
+        try { await pauseCampaign(campaignId); } catch { /* Keep the uncertain outcome. */ }
+        throw new ManagedInstantlyError("Followup activation is uncertain. Pause was attempted; reconcile immutable provider mail history before retrying.", {
+          code: error.code, status: error.status, outcomeUnknown: true, providerId: campaignId,
+          expectedSequenceFingerprint: proof.expectedSequenceFingerprint,
+        });
+      }
+      throw error;
+    }
+  }
 
   return {
     capabilities: INSTANTLY_MANAGED_CAPABILITIES,
     listAccounts() {
-      return allPages(cursor => request("GET", "/accounts", v => page(v, value => {
-        const a = object(value); string(a.email); numeric(a.warmup_status);
-        if (typeof a.setup_pending !== "boolean") throw new Error("Missing setup status");
-        if (a.status !== undefined) numeric(a.status);
-        // Do not expose unrelated account configuration or credentials to callers.
-        return { email: a.email, warmup_status: a.warmup_status, setup_pending: a.setup_pending,
-          status: a.status, daily_limit: a.daily_limit, stat_warmup_score: a.stat_warmup_score,
-          timestamp_created: a.timestamp_created } as ManagedInstantlyAccount;
-      }), { query: { limit: "100", starting_after: cursor } }));
+      return allPages(cursor => request("GET", "/accounts", v => page(v, parseAccount), { query: { limit: "100", starting_after: cursor } }));
     },
+    getAccountHealth,
     listCampaigns() {
       return allPages(cursor => request("GET", "/campaigns", v => page(v, parseCampaign), { query: { limit: "100", starting_after: cursor } }));
     },
@@ -374,15 +744,19 @@ export function createManagedInstantlyClient(apiKey: string, options: {
     listEmailsPage,
     listEmails(window: EmailWindow = {}) { return allPages(cursor => listEmailsPage(window, cursor)); },
     listInboundEmails,
-    getEmail(id: string) { return request("GET", `/emails/${inputId(id)}`, parseEmail); },
+    getEmail,
+    appendNextStep,
+    activateNextStep,
     async createPausedCampaign(input: PausedCampaignInput) {
       if (!input.name?.trim() || !input.subject?.trim() || !input.bodyText?.trim()) invalid("Campaign name, subject and body are required.");
       if (!Array.isArray(input.senderEmails) || input.senderEmails.length !== 1) invalid("Exactly one explicit sending account is required.");
       const senders = input.senderEmails.map(inputEmail);
+      const timing = input.timing ?? { from: "09:00", to: "16:00" };
+      if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(timing.from) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(timing.to) || timing.from >= timing.to) invalid("An ordered, same-day HH:mm sending window is required.");
       const html = input.bodyText.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\r?\n/g, "<br/>");
       const campaign = await request("POST", "/campaigns", parseCampaign, { mutation: true, body: {
         name: input.name, email_list: senders,
-        campaign_schedule: { schedules: [{ name: "US business hours", timing: { from: "09:00", to: "16:00" },
+        campaign_schedule: { schedules: [{ name: "US business hours", timing,
           days: { "0": false, "1": true, "2": true, "3": true, "4": true, "5": true, "6": false },
           timezone: input.timezone ?? "America/Detroit" }] },
         sequences: [{ steps: [{ type: "email", delay: 0, variants: [{ subject: input.subject, body: html }] }] }],

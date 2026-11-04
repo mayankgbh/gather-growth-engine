@@ -1,4 +1,8 @@
-import { createManagedInstantlyClient, ManagedInstantlyError } from "@/lib/managed-outreach/instantly";
+import {
+  createManagedInstantlyClient, fingerprintCampaignSequence, ManagedInstantlyError,
+  planInstantlyFollowup, type InstantlyFollowupProof, type ManagedInstantlyCampaign,
+  type ManagedInstantlyEmail, type ManagedInstantlyLead,
+} from "@/lib/managed-outreach/instantly";
 
 const address = "buyer@example.com";
 const campaign = {
@@ -19,6 +23,60 @@ function setup(...responses: unknown[]) {
   return { fetcher, client: createManagedInstantlyClient("test-key", { fetch: fetcher as typeof fetch }) };
 }
 function paths(fetcher: jest.Mock) { return fetcher.mock.calls.map(call => new URL(call[0]).pathname); }
+
+function followupFixture() {
+  const sentTime = Date.now() - 12 * 86_400_000;
+  const outbound = (step: number, at: number): ManagedInstantlyEmail => ({
+    ...mail(`sent-${step}`), ue_type: 1, campaign_id: campaign.id, lead_id: lead.id, lead: address,
+    eaccount: "mayank@example.net", from_address_email: "mayank@example.net", to_address_email_list: address,
+    subject: step === 1 ? "Research" : "Re: Research", step: `opaque-provider-step-${step}`,
+    timestamp_email: new Date(at).toISOString(), timestamp_created: new Date(at + 1000).toISOString(),
+  });
+  const state: {
+    campaign: ManagedInstantlyCampaign; lead: ManagedInstantlyLead; history: ManagedInstantlyEmail[];
+    inbound: ManagedInstantlyEmail[]; unmatchedThreadReply?: ManagedInstantlyEmail; patchFailsAfterApplying: boolean;
+    getOverride?: (email: ManagedInstantlyEmail) => ManagedInstantlyEmail;
+  } = {
+    campaign: { ...campaign, status: 3, sequences: [{ steps: [{ ...campaign.sequences[0].steps[0], delay: 0 }] }] },
+    lead: { ...lead, status: 3, timestamp_last_contact: new Date(sentTime).toISOString(), last_step_from: "campaign", last_step_id: "opaque-provider-step-1" },
+    history: [outbound(1, sentTime)], inbound: [], patchFailsAfterApplying: false,
+  };
+  const fetcher = jest.fn(async (url: string, init: RequestInit) => {
+    const parsed = new URL(url); const path = parsed.pathname;
+    let value: unknown;
+    if (path === `/api/v2/campaigns/${campaign.id}` && init.method === "GET") value = state.campaign;
+    else if (path === `/api/v2/campaigns/${campaign.id}/pause`) { state.campaign = { ...state.campaign, status: 2 }; value = state.campaign; }
+    else if (path === `/api/v2/campaigns/${campaign.id}` && init.method === "PATCH") {
+      const body = JSON.parse(init.body as string);
+      state.campaign = { ...state.campaign, sequences: body.sequences };
+      state.lead = { ...state.lead, status: 1 };
+      if (state.patchFailsAfterApplying) throw new Error("Lost response after provider accepted PATCH");
+      value = state.campaign;
+    } else if (path === `/api/v2/campaigns/${campaign.id}/activate`) { state.campaign = { ...state.campaign, status: 1 }; value = state.campaign; }
+    else if (path === "/api/v2/leads/list") value = { items: [state.lead] };
+    else if (path === "/api/v2/block-lists-entries") value = { items: [] };
+    else if (path === "/api/v2/emails") value = { items: parsed.searchParams.get("email_type") === "received" ? state.inbound
+      : parsed.searchParams.get("search") && state.unmatchedThreadReply ? [...state.history, state.unmatchedThreadReply] : state.history };
+    else if (path.startsWith("/api/v2/emails/")) {
+      const found = state.history.find(email => email.id === path.split("/").at(-1))!;
+      value = state.getOverride ? state.getOverride(found) : found;
+    } else throw new Error(`Unexpected mocked request ${init.method} ${path}`);
+    return new Response(JSON.stringify(value));
+  });
+  const client = createManagedInstantlyClient("test-key", { fetch: fetcher as typeof fetch });
+  const proof = (): InstantlyFollowupProof => ({
+    expectedRecipientEmail: address, expectedSenderEmail: "mayank@example.net", expectedThreadId: "same-thread",
+    priorSentEmailIds: state.history.map(email => email.id), expectedSequenceFingerprint: fingerprintCampaignSequence(state.campaign),
+  });
+  const completeNextStep = () => {
+    const step = state.history.length + 1;
+    const next = outbound(step, sentTime + (step - 1) * 2 * 86_400_000);
+    state.history.push(next);
+    state.campaign = { ...state.campaign, status: 3 };
+    state.lead = { ...state.lead, status: 3, timestamp_last_contact: next.timestamp_email, last_step_id: next.step };
+  };
+  return { state, fetcher, client, proof, completeNextStep };
+}
 
 describe("restricted Instantly adapter", () => {
   it("paginates mailbox inventory and excludes unrelated account configuration", async () => {
@@ -114,6 +172,15 @@ describe("restricted Instantly adapter", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it("accepts explicit converted sending hours and rejects invalid or overnight windows", async () => {
+    const { client, fetcher } = setup({ ...campaign, status: 0 }, campaign);
+    await client.createPausedCampaign({ name: "Pacific recipient", senderEmails: ["mayank@example.net"], subject: "Research", bodyText: "Hello",
+      timezone: "America/Detroit", timing: { from: "12:00", to: "18:00" } });
+    expect(JSON.parse(fetcher.mock.calls[0][1].body).campaign_schedule.schedules[0]).toMatchObject({ timezone: "America/Detroit", timing: { from: "12:00", to: "18:00" } });
+    await expect(client.createPausedCampaign({ name: "Invalid", senderEmails: ["mayank@example.net"], subject: "Research", bodyText: "Hello", timing: { from: "23:00", to: "05:00" } })).rejects.toMatchObject({ code: "invalid_input" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
   it("retains the created campaign ID when the pause confirmation fails", async () => {
     const { client, fetcher } = setup({ ...campaign, status: 0 });
     fetcher.mockRejectedValueOnce(new Error("network error"));
@@ -188,5 +255,176 @@ describe("restricted Instantly adapter", () => {
     await expect(client.activateCampaign(campaign.id, { preflightCheckedAt: new Date().toISOString(), expectedRecipientEmail: address })).rejects.toMatchObject({ outcomeUnknown: true, providerId: campaign.id });
     expect(paths(fetcher).filter(path => path.endsWith("/activate"))).toHaveLength(1);
     expect(paths(fetcher).at(-1)).toBe("/api/v2/campaigns/campaign-1/pause");
+  });
+
+  it("plans one blank-subject native followup while preserving completed copy and leaving input untouched", () => {
+    const { state, proof } = followupFixture();
+    const original = JSON.parse(JSON.stringify(state.campaign));
+    const plan = planInstantlyFollowup(state.campaign, { expectedSequenceFingerprint: proof().expectedSequenceFingerprint, bodyText: "A second idea\nfor your team", delayDays: 3 });
+    expect(state.campaign).toEqual(original);
+    expect(plan.sequences[0].steps).toHaveLength(2);
+    expect(plan.sequences[0].steps[0]).toEqual({ ...original.sequences[0].steps[0], delay: 3, delay_unit: "days" });
+    expect(plan.sequences[0].steps[1].variants[0]).toEqual({ subject: "", body: "A second idea<br/>for your team" });
+    expect(plan.sequenceFingerprint).not.toBe(proof().expectedSequenceFingerprint);
+  });
+
+  it("fingerprints canonical sequence data independently of provider key order", () => {
+    const { state } = followupFixture();
+    const equivalent = { ...state.campaign, sequences: [{ steps: [{ variants: [{ body: "Hello", subject: "Research" }], delay: 0, type: "email" }] }] };
+    expect(fingerprintCampaignSequence(state.campaign)).toBe(fingerprintCampaignSequence(equivalent));
+  });
+
+  it("stages one next step only, checks immutable outbound proof, and does not activate", async () => {
+    const { client, state, fetcher, proof } = followupFixture();
+    const input = proof();
+    const result = await client.appendNextStep(campaign.id, { ...input, bodyText: "Next researched example", delayDays: 3 });
+    expect(result.nextStep).toBe(2);
+    expect(result.campaign.status).toBe(2);
+    expect(result.sequenceFingerprint).toBe(fingerprintCampaignSequence(state.campaign));
+    expect(paths(fetcher)).toContain("/api/v2/emails/sent-1");
+    expect(paths(fetcher).some(path => path.endsWith("/activate"))).toBe(false);
+    expect(fetcher.mock.calls.filter(call => call[1].method === "PATCH")).toHaveLength(1);
+  });
+
+  it.each([
+    ["sender", { from_address_email: "someone-else@example.net" }],
+    ["recipient", { to_address_email_list: "other@example.com" }],
+    ["extra recipient", { to_address_email_list: `${address},other@example.com` }],
+    ["thread", { thread_id: "another-thread" }],
+    ["campaign", { campaign_id: "different-campaign" }],
+    ["scheduled source", { ue_type: 4 }],
+    ["incomplete source body", { body_fallback_reason: "unavailable" }],
+  ])("holds followup when immutable %s evidence mismatches", async (_name, change) => {
+    const { client, state, fetcher, proof } = followupFixture();
+    state.getOverride = email => ({ ...email, ...change }) as ManagedInstantlyEmail;
+    await expect(client.appendNextStep(campaign.id, { ...proof(), bodyText: "Example", delayDays: 3 })).rejects.toMatchObject({ code: "launch_blocked" });
+    expect(fetcher.mock.calls.some(call => call[1].method === "PATCH" || new URL(call[0]).pathname.endsWith("/activate"))).toBe(false);
+  });
+
+  it("holds a changed original sequence instead of silently adopting it", async () => {
+    const { client, state, fetcher, proof } = followupFixture();
+    const savedProof = proof();
+    state.campaign.sequences![0].steps[0].variants[0].body = "Unreviewed manual edit";
+    await expect(client.appendNextStep(campaign.id, { ...savedProof, bodyText: "Example", delayDays: 3 })).rejects.toMatchObject({ code: "launch_blocked" });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("holds duplicate or unexpected provider sends and incomplete progress", async () => {
+    const { client, state, fetcher, proof } = followupFixture();
+    const savedProof = proof();
+    state.history.push({ ...state.history[0], id: "unexpected-send" });
+    await expect(client.appendNextStep(campaign.id, { ...savedProof, bodyText: "Example", delayDays: 3 })).rejects.toMatchObject({ code: "launch_blocked" });
+    expect(fetcher.mock.calls.some(call => call[1].method === "PATCH")).toBe(false);
+    state.history.pop();
+    state.lead.status = 1;
+    await expect(client.appendNextStep(campaign.id, { ...savedProof, bodyText: "Example", delayDays: 3 })).rejects.toMatchObject({ code: "launch_blocked" });
+  });
+
+  it("holds lead progress that points to a different executed step", async () => {
+    const { client, state, proof } = followupFixture();
+    state.lead.last_step_id = "different-opaque-step";
+    await expect(client.appendNextStep(campaign.id, { ...proof(), bodyText: "Example", delayDays: 3 })).rejects.toMatchObject({ code: "launch_blocked" });
+  });
+
+  it("does not append twice after a lost PATCH response and preserves the intended fingerprint for reconciliation", async () => {
+    const { client, state, fetcher, proof } = followupFixture();
+    const input = { ...proof(), bodyText: "Example", delayDays: 3 };
+    const plan = planInstantlyFollowup(state.campaign, input);
+    state.patchFailsAfterApplying = true;
+    await expect(client.appendNextStep(campaign.id, input)).rejects.toMatchObject({ outcomeUnknown: true, providerId: campaign.id, expectedSequenceFingerprint: plan.sequenceFingerprint });
+    expect(state.campaign.status).toBe(2);
+    expect(state.campaign.sequences![0].steps).toHaveLength(2);
+    await expect(client.appendNextStep(campaign.id, input)).rejects.toMatchObject({ code: "launch_blocked" });
+    expect(fetcher.mock.calls.filter(call => call[1].method === "PATCH")).toHaveLength(1);
+  });
+
+  it("dispatches only the appended step after fresh checks and keeps queued separate from sent", async () => {
+    const { client, state, fetcher, proof } = followupFixture();
+    const originalProof = proof();
+    const staged = await client.appendNextStep(campaign.id, { ...originalProof, bodyText: "Example", delayDays: 3 });
+    const active = await client.activateNextStep(campaign.id, { ...originalProof, expectedSequenceFingerprint: staged.sequenceFingerprint, preflightCheckedAt: new Date().toISOString() });
+    expect(active.status).toBe(1);
+    expect(state.history).toHaveLength(1);
+    expect(paths(fetcher).filter(path => path.endsWith("/activate"))).toHaveLength(1);
+  });
+
+  it("holds a staged followup if a reply arrives before activation", async () => {
+    const { client, state, fetcher, proof } = followupFixture();
+    const originalProof = proof();
+    const staged = await client.appendNextStep(campaign.id, { ...originalProof, bodyText: "Example", delayDays: 3 });
+    state.inbound = [mail("new-human-reply") as ManagedInstantlyEmail];
+    await expect(client.activateNextStep(campaign.id, { ...originalProof, expectedSequenceFingerprint: staged.sequenceFingerprint, preflightCheckedAt: new Date().toISOString() })).rejects.toMatchObject({ code: "launch_blocked" });
+    expect(paths(fetcher).some(path => path.endsWith("/activate"))).toBe(false);
+  });
+
+  it("holds replies from another address in the actual thread even before provider lead attachment", async () => {
+    const { client, state, fetcher, proof } = followupFixture();
+    state.unmatchedThreadReply = { ...mail("forwarded-colleague-reply"), from_address_email: "colleague@example.com", campaign_id: null, lead: null } as ManagedInstantlyEmail;
+    await expect(client.appendNextStep(campaign.id, { ...proof(), bodyText: "Example", delayDays: 3 })).rejects.toMatchObject({ code: "launch_blocked" });
+    expect(fetcher.mock.calls.some(call => call[1].method === "PATCH")).toBe(false);
+  });
+
+  it("holds followups not yet due from the prior actual send", async () => {
+    const { client, state, fetcher, proof } = followupFixture();
+    const originalProof = proof();
+    const staged = await client.appendNextStep(campaign.id, { ...originalProof, bodyText: "Example", delayDays: 30 });
+    await expect(client.activateNextStep(campaign.id, { ...originalProof, expectedSequenceFingerprint: staged.sequenceFingerprint, preflightCheckedAt: new Date().toISOString() })).rejects.toMatchObject({ code: "launch_blocked" });
+    expect(paths(fetcher).some(path => path.endsWith("/activate"))).toBe(false);
+    expect(state.history).toHaveLength(1);
+  });
+
+  it("supports all five native threaded steps with exactly one pending step at each dispatch", async () => {
+    const { client, state, proof, completeNextStep } = followupFixture();
+    for (let nextStep = 2; nextStep <= 5; nextStep++) {
+      const before = proof();
+      const staged = await client.appendNextStep(campaign.id, { ...before, bodyText: `Example ${nextStep}`, delayDays: 2 });
+      expect(staged.nextStep).toBe(nextStep);
+      expect(state.campaign.sequences![0].steps.length - state.history.length).toBe(1);
+      await client.activateNextStep(campaign.id, { ...before, expectedSequenceFingerprint: staged.sequenceFingerprint, preflightCheckedAt: new Date().toISOString() });
+      completeNextStep();
+    }
+    expect(state.history).toHaveLength(5);
+    expect(state.campaign.sequences![0].steps.map(step => step.variants[0].subject)).toEqual(["Research", "", "", "", ""]);
+    expect(() => planInstantlyFollowup(state.campaign, { expectedSequenceFingerprint: fingerprintCampaignSequence(state.campaign), bodyText: "Sixth", delayDays: 3 })).toThrow(ManagedInstantlyError);
+  });
+
+  it("reports real campaign observations separately from warmup placement and unobserved authentication", async () => {
+    const { client, fetcher } = setup(
+      { email: "mayank@example.net", warmup_status: 1, setup_pending: false, status: 1, daily_limit: 20, stat_warmup_score: 100, smtp_password: "hidden" },
+      [{ date: "2026-11-03", email_account: "mayank@example.net", sent: 10, bounced: 1, replies: 2 }],
+      { email_date_data: { "mayank@example.net": { "2026-11-03": { sent: 15, landed_inbox: 15 }, "2026-10-01": { sent: 10 } } },
+        aggregate_data: { "mayank@example.net": { sent: 100, received: 80, landed_inbox: 100, landed_spam: 0, health_score: 100 } } },
+    );
+    const result = await client.getAccountHealth("mayank@example.net", { startDate: "2026-11-03", endDate: "2026-11-04" });
+    expect(result.campaign).toMatchObject({ sent: 10, bounced: 1, bounceRatio: 0.1, completeWindow: false, missingDates: ["2026-11-04"] });
+    expect(result.warmup.dailyObserved).toEqual([{ date: "2026-11-03", sent: 15, received: null, landed_inbox: 15, landed_spam: null }]);
+    expect(result.warmup.aggregateWindow).toBe("provider_defined_not_requested_window");
+    expect(result.complaints.status).toBe("not_exposed_by_reviewed_endpoints");
+    expect(result.authentication.status).toBe("not_checked");
+    expect(result.account).not.toHaveProperty("smtp_password");
+    expect(new URL(fetcher.mock.calls[1][0]).searchParams.get("emails")).toBe("mayank@example.net");
+    expect(paths(fetcher).some(path => path.includes("vitals"))).toBe(false);
+  });
+
+  it("keeps empty campaign/warmup observations unknown rather than manufacturing zeros", async () => {
+    const { client } = setup({ email: "mayank@example.net", warmup_status: 1, setup_pending: false }, [], { email_date_data: {}, aggregate_data: {} });
+    const result = await client.getAccountHealth("mayank@example.net", { startDate: "2026-11-04", endDate: "2026-11-04" });
+    expect(result.campaign).toMatchObject({ sent: null, bounced: null, bounceRatio: null, completeWindow: false });
+    expect(result.warmup.aggregate).toBeNull();
+  });
+
+  it.each([
+    [{ date: "2026-11-04", email_account: "other@example.net", sent: 10, bounced: 0 }],
+    [{ date: "2026-11-04", email_account: "mayank@example.net", sent: -1, bounced: 0 }],
+    [{ date: "2026-11-04", email_account: "mayank@example.net", sent: 1, bounced: 0 }, { date: "2026-11-04", email_account: "mayank@example.net", sent: 1, bounced: 0 }],
+  ])("fails closed on unexpected campaign health rows %#", async (...rows) => {
+    const { client } = setup({ email: "mayank@example.net", warmup_status: 1, setup_pending: false }, rows, { email_date_data: {}, aggregate_data: {} });
+    await expect(client.getAccountHealth("mayank@example.net", { startDate: "2026-11-04", endDate: "2026-11-04" })).rejects.toMatchObject({ code: "invalid_response" });
+  });
+
+  it("rejects unsupported analytics ranges before any request", async () => {
+    const { client, fetcher } = setup();
+    await expect(client.getAccountHealth("mayank@example.net", { startDate: "2026-10-01", endDate: "2026-11-04" })).rejects.toMatchObject({ code: "invalid_input" });
+    expect(fetcher).not.toHaveBeenCalled();
   });
 });
