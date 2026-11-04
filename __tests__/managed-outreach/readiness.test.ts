@@ -111,8 +111,10 @@ describe("managed outreach readiness boundary", () => {
       warmup_status: 1, setup_pending: false, daily_limit: { secret: "synthetic-nested-secret" },
       stat_warmup_score: { secret: "synthetic-nested-secret" }, timestamp_created: { secret: "synthetic-nested-secret" },
     }] })));
-    const body = await (await GET(request())).json();
-    expect(body.accounts[0]).toMatchObject({ dailyLimit: null, warmupScore: null, createdAt: null });
+    const response = await GET(request());
+    expect(response.status).toBe(502);
+    const body = await response.json();
+    expect(body.accounts).toEqual([]);
     expect(JSON.stringify(body)).not.toContain("synthetic-");
   });
 

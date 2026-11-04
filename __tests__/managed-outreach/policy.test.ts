@@ -16,6 +16,13 @@ function footer(): FooterConfig {
   return { businessPostalAddress: "123 Example Street, Example City, CA 90000", postalAddressApproved: true, unsubscribeText: "Reply unsubscribe to stop these emails.", replyOptOutEnabled: true };
 }
 
+it("preserves unavailable complaint feedback as unknown instead of inventing zero", () => {
+  const observed = { ...mailbox(), complaintsLast7Days: null, complaintFeedbackAvailable: false };
+  expect(evaluateMailbox(observed, { now }).eligible).toBe(true);
+  expect(evaluateMailbox({ ...observed, complaintFeedbackAvailable: undefined }, { now }).eligible).toBe(false);
+  expect(evaluateMailbox({ ...observed, complaintsLast7Days: 1 }, { now }).eligible).toBe(false);
+});
+
 describe("managed outreach eligibility", () => {
   it("accepts a verified US B2B director at a company with at least 101 employees", () => {
     expect(evaluateCandidate(candidate(), { now }).eligible).toBe(true);

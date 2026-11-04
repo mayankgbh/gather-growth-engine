@@ -92,6 +92,57 @@ model Workspace {
   sentCampaigns SentCampaign[]
   campaigns     Campaign[]
   performanceObservations PerformanceObservation[]
+  managedOutreachJobs ManagedOutreachJob[]
+  managedOutreachEvents ManagedOutreachEvent[]
+}
+
+// Owner-scoped state for managed outreach. New imports are held until preflight.
+model ManagedOutreachJob {
+  id                    String   @id @default(cuid())
+  workspaceId           String
+  externalId            String
+  email                 String
+  companyDomain         String
+  candidateJson         String
+  stepsJson             String
+  experimentId          String
+  variant               String
+  senderEmail           String
+  status                String   @default("held")
+  providerCampaignId    String?  @unique
+  sequenceFingerprint   String?
+  nextStep              Int      @default(1)
+  dueAt                 DateTime?
+  leaseToken            String?
+  leaseUntil            DateTime?
+  lastError             String?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  workspace Workspace              @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  events    ManagedOutreachEvent[]
+
+  @@unique([workspaceId, externalId])
+  @@unique([workspaceId, email])
+  @@index([workspaceId, status, dueAt])
+}
+
+// Caller-assigned IDs are immutable receipts and deduplicate provider replay.
+model ManagedOutreachEvent {
+  id                String   @id
+  jobId             String?
+  workspaceId       String
+  type              String
+  providerMessageId String?
+  occurredAt        DateTime
+  dataJson          String
+  createdAt         DateTime @default(now())
+
+  job       ManagedOutreachJob? @relation(fields: [jobId], references: [id], onDelete: SetNull)
+  workspace Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, type, occurredAt])
+  @@index([jobId, occurredAt])
 }
 
 model Campaign {

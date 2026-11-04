@@ -1,5 +1,5 @@
 {
-  "buildCommand": "prisma generate && next build",
+  "buildCommand": "prisma generate && node scripts/ensure-managed-outreach-schema.cjs && next build",
   "installCommand": "npm install",
   "framework": "nextjs",
   "regions": ["iad1"]

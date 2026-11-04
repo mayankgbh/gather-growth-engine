@@ -224,25 +224,32 @@ describe("restricted Instantly adapter", () => {
 
   it("refuses activation without a recent external preflight", async () => {
     const { client, fetcher } = setup();
-    await expect(client.activateCampaign(campaign.id, { preflightCheckedAt: new Date(Date.now() - 61_000).toISOString(), expectedRecipientEmail: address })).rejects.toMatchObject({ code: "launch_blocked" });
+    await expect(client.activateCampaign(campaign.id, { preflightCheckedAt: new Date(Date.now() - 61_000).toISOString(), expectedRecipientEmail: address, expectedSenderEmail: "mayank@example.net" })).rejects.toMatchObject({ code: "launch_blocked" });
     expect(fetcher).not.toHaveBeenCalled();
   });
 
   it("refuses provider multi-step drips", async () => {
     const { client, fetcher } = setup({ ...campaign, sequences: [{ steps: [...campaign.sequences[0].steps, ...campaign.sequences[0].steps] }] });
-    await expect(client.activateCampaign(campaign.id, { preflightCheckedAt: new Date().toISOString(), expectedRecipientEmail: address })).rejects.toMatchObject({ code: "launch_blocked" });
+    await expect(client.activateCampaign(campaign.id, { preflightCheckedAt: new Date().toISOString(), expectedRecipientEmail: address, expectedSenderEmail: "mayank@example.net" })).rejects.toMatchObject({ code: "launch_blocked" });
     expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses first-touch activation after the provider sender changes", async () => {
+    const { client, fetcher } = setup({ ...campaign, email_list: ["different-mailbox@example.net"] });
+    await expect(client.activateCampaign(campaign.id, { preflightCheckedAt: new Date().toISOString(), expectedRecipientEmail: address, expectedSenderEmail: "mayank@example.net" })).rejects.toMatchObject({ code: "launch_blocked" });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(paths(fetcher).some(path => path.endsWith("/activate"))).toBe(false);
   });
 
   it("holds a recipient with an incoming reply instead of dispatching", async () => {
     const { client, fetcher } = setup(campaign, { items: [lead] }, { items: [] }, { items: [mail("reply-1")] });
-    await expect(client.activateCampaign(campaign.id, { preflightCheckedAt: new Date().toISOString(), expectedRecipientEmail: address })).rejects.toMatchObject({ code: "launch_blocked" });
+    await expect(client.activateCampaign(campaign.id, { preflightCheckedAt: new Date().toISOString(), expectedRecipientEmail: address, expectedSenderEmail: "mayank@example.net" })).rejects.toMatchObject({ code: "launch_blocked" });
     expect(paths(fetcher).some(path => path.endsWith("/activate"))).toBe(false);
   });
 
   it("queues only one guarded first touch and does not invent a sent receipt", async () => {
     const { client, fetcher } = setup(campaign, { items: [lead] }, { items: [] }, { items: [] }, { ...campaign, status: 1 });
-    const result = await client.activateCampaign(campaign.id, { preflightCheckedAt: new Date().toISOString(), expectedRecipientEmail: address });
+    const result = await client.activateCampaign(campaign.id, { preflightCheckedAt: new Date().toISOString(), expectedRecipientEmail: address, expectedSenderEmail: "mayank@example.net" });
     expect(result.status).toBe(1);
     expect(result).not.toHaveProperty("message_id");
     expect(paths(fetcher).filter(path => path.endsWith("/activate"))).toHaveLength(1);
@@ -252,7 +259,7 @@ describe("restricted Instantly adapter", () => {
     const { client, fetcher } = setup(campaign, { items: [lead] }, { items: [] }, { items: [] });
     fetcher.mockRejectedValueOnce(new Error("connection lost"));
     fetcher.mockResolvedValueOnce(new Response(JSON.stringify(campaign)));
-    await expect(client.activateCampaign(campaign.id, { preflightCheckedAt: new Date().toISOString(), expectedRecipientEmail: address })).rejects.toMatchObject({ outcomeUnknown: true, providerId: campaign.id });
+    await expect(client.activateCampaign(campaign.id, { preflightCheckedAt: new Date().toISOString(), expectedRecipientEmail: address, expectedSenderEmail: "mayank@example.net" })).rejects.toMatchObject({ outcomeUnknown: true, providerId: campaign.id });
     expect(paths(fetcher).filter(path => path.endsWith("/activate"))).toHaveLength(1);
     expect(paths(fetcher).at(-1)).toBe("/api/v2/campaigns/campaign-1/pause");
   });
@@ -426,5 +433,41 @@ describe("restricted Instantly adapter", () => {
     const { client, fetcher } = setup();
     await expect(client.getAccountHealth("mayank@example.net", { startDate: "2026-10-01", endDate: "2026-11-04" })).rejects.toMatchObject({ code: "invalid_input" });
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("runs a separately explicit diagnostic only for the exact selected mailbox and whitelists DNS results", async () => {
+    const { client, fetcher } = setup({ status: "success", success_list: [{ domain: "example.net", allPass: true,
+      mx: true, spf: true, dkim: true, dmarc: true, indeterminate: [], smtp_password: "must-not-escape" }], failure_list: [] });
+    const result = await client.runAccountVitals("mayank@example.net");
+    expect(JSON.parse(fetcher.mock.calls[0][1].body)).toEqual({ accounts: ["mayank@example.net"] });
+    expect(paths(fetcher)).toEqual(["/api/v2/accounts/test/vitals"]);
+    expect(result.success_list[0]).toEqual({ domain: "example.net", allPass: true, mx: true, spf: true, dkim: true, dmarc: true, indeterminate: [] });
+    expect(result.connectionStatus).toBe("not_reported_by_this_endpoint");
+    expect(result.countsAsCampaignSend).toBe(false);
+  });
+
+  it("retains indeterminate DNS checks as non-passing results", async () => {
+    const { client } = setup({ status: "success", success_list: [], failure_list: [{ domain: "example.net", allPass: false,
+      mx: true, spf: true, dkim: false, dmarc: true, indeterminate: ["dkim"] }] });
+    const result = await client.runAccountVitals("mayank@example.net");
+    expect(result.failure_list[0]).toMatchObject({ allPass: false, dkim: false, indeterminate: ["dkim"] });
+    expect(result.success_list).toEqual([]);
+  });
+
+  it("refuses contradictory DNS passes and unrelated domain results", async () => {
+    for (const row of [
+      { domain: "example.net", allPass: true, mx: true, spf: false, dkim: true, dmarc: true },
+      { domain: "unrequested.net", allPass: true, mx: true, spf: true, dkim: true, dmarc: true },
+    ]) {
+      const { client } = setup({ status: "success", success_list: [row], failure_list: [] });
+      await expect(client.runAccountVitals("mayank@example.net")).rejects.toMatchObject({ code: "invalid_response", outcomeUnknown: true });
+    }
+  });
+
+  it("never implicitly retries a diagnostic after an uncertain provider error", async () => {
+    const fetcher = jest.fn().mockResolvedValue(new Response("unavailable", { status: 503 }));
+    const client = createManagedInstantlyClient("test-key", { fetch: fetcher as typeof fetch });
+    await expect(client.runAccountVitals("mayank@example.net")).rejects.toMatchObject({ code: "provider_error", outcomeUnknown: true });
+    expect(fetcher).toHaveBeenCalledTimes(1);
   });
 });

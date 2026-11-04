@@ -43,7 +43,9 @@ export type MailboxReadiness = {
   healthyHistoryDays: number;
   sentLast7Days: number;
   bouncedLast7Days: number;
-  complaintsLast7Days: number;
+  complaintsLast7Days: number | null;
+  /** Null is explicitly unknown when the provider does not expose complaint feedback. */
+  complaintFeedbackAvailable?: boolean;
   warmupStatus?: number | string;
 };
 export type FooterConfig = {
@@ -146,10 +148,13 @@ export function evaluateMailbox(mailbox: MailboxReadiness, options: { now?: Date
   if (mailbox?.connected !== true || mailbox.authenticationPassed !== true || mailbox.replyInboxReady !== true) reasons.push("The selected mailbox needs verified authentication, a connected account and working reply collection.");
   if (!timestampFresh(mailbox?.healthCheckedAt, now, MAX_MAILBOX_EVIDENCE_AGE) || !mailbox?.healthSource?.trim()) reasons.push("Mailbox health must be checked from a recorded source within 15 minutes of sending.");
   if (mailbox?.reputation !== "healthy" || !Number.isInteger(mailbox.healthyHistoryDays) || mailbox.healthyHistoryDays < 14) reasons.push("At least 14 days of measured healthy mailbox history is required; active warmup alone does not qualify.");
-  const counts = [mailbox?.sentLast7Days, mailbox?.bouncedLast7Days, mailbox?.complaintsLast7Days];
-  const validCounts = counts.every(value => Number.isInteger(value) && value >= 0) && mailbox.bouncedLast7Days <= mailbox.sentLast7Days && mailbox.complaintsLast7Days <= mailbox.sentLast7Days;
+  const counts = [mailbox?.sentLast7Days, mailbox?.bouncedLast7Days];
+  const complaintsValid = mailbox?.complaintsLast7Days === null
+    ? mailbox.complaintFeedbackAvailable === false
+    : Number.isInteger(mailbox?.complaintsLast7Days) && mailbox.complaintsLast7Days! >= 0 && mailbox.complaintsLast7Days! <= mailbox.sentLast7Days;
+  const validCounts = counts.every(value => Number.isInteger(value) && value >= 0) && mailbox.bouncedLast7Days <= mailbox.sentLast7Days && complaintsValid;
   if (!validCounts) reasons.push("Mailbox delivery and complaint counts must be complete, nonnegative and internally consistent.");
-  else if (mailbox.complaintsLast7Days > 0 || (mailbox.sentLast7Days > 0 && mailbox.bouncedLast7Days / mailbox.sentLast7Days >= 0.02)) reasons.push("Mailbox health is paused for a complaint or a bounce rate of at least 2%.");
+  else if ((mailbox.complaintsLast7Days ?? 0) > 0 || (mailbox.sentLast7Days > 0 && mailbox.bouncedLast7Days / mailbox.sentLast7Days >= 0.02)) reasons.push("Mailbox health is paused for a complaint or a bounce rate of at least 2%.");
   return decision(reasons, now);
 }
 

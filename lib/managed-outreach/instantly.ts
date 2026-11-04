@@ -210,6 +210,26 @@ export type InstantlyAccountHealth = {
   authentication: { status: "not_checked" };
   sources: string[];
 };
+export type InstantlyDomainVitals = {
+  domain: string;
+  allPass: boolean;
+  mx: boolean;
+  spf: boolean;
+  dkim: boolean;
+  dmarc: boolean;
+  indeterminate: Array<"mx" | "spf" | "dkim" | "dmarc">;
+};
+export type InstantlyAccountVitals = {
+  email: string;
+  observedAt: string;
+  status: "success";
+  success_list: InstantlyDomainVitals[];
+  failure_list: InstantlyDomainVitals[];
+  scope: "domain_dns_diagnostic";
+  connectionStatus: "not_reported_by_this_endpoint";
+  countsAsCampaignSend: false;
+  source: string;
+};
 
 function blocked(message: string): never {
   throw new ManagedInstantlyError(message, { code: "launch_blocked" });
@@ -506,6 +526,38 @@ export function createManagedInstantlyClient(apiKey: string, options: {
         "https://help.instantly.ai/en/articles/13939939-warmup-health-score"],
     };
   }
+  /**
+   * Explicit diagnostic only, never called by passive inventory/health reads.
+   * The provider documentation does not exclude internal test sending; therefore
+   * a timeout is an uncertain diagnostic outcome, never an automatic retry.
+   */
+  async function runAccountVitals(email: string): Promise<InstantlyAccountVitals> {
+    const exact = inputEmail(email);
+    const expectedDomain = exact.split("@")[1];
+    return request("POST", "/accounts/test/vitals", value => {
+      const v = object(value);
+      if (v.status !== "success" || !Array.isArray(v.success_list) || !Array.isArray(v.failure_list)) throw new Error("Missing diagnostic results");
+      const parseResult = (item: unknown, success: boolean): InstantlyDomainVitals => {
+        const row = object(item);
+        const domain = string(row.domain).toLowerCase();
+        if (domain !== expectedDomain) throw new Error("Diagnostic returned an unexpected domain");
+        for (const key of ["allPass", "mx", "spf", "dkim", "dmarc"]) if (typeof row[key] !== "boolean") throw new Error("Incomplete DNS result");
+        const uncertain = row.indeterminate === undefined ? [] : row.indeterminate;
+        if (!Array.isArray(uncertain) || uncertain.some(key => !["mx", "spf", "dkim", "dmarc"].includes(key)) || new Set(uncertain).size !== uncertain.length) throw new Error("Invalid indeterminate DNS result");
+        if (row.allPass !== success || (row.allPass && (!row.mx || !row.spf || !row.dkim || !row.dmarc || uncertain.length))) throw new Error("Inconsistent DNS diagnostic result");
+        return { domain, allPass: row.allPass, mx: row.mx, spf: row.spf, dkim: row.dkim, dmarc: row.dmarc,
+          indeterminate: uncertain } as InstantlyDomainVitals;
+      };
+      // One requested mailbox has one domain; no broad workspace results leak out.
+      if (v.success_list.length + v.failure_list.length !== 1) throw new Error("Expected exactly one diagnostic domain result");
+      return { email: exact, observedAt: new Date().toISOString(), status: "success",
+        success_list: v.success_list.map(item => parseResult(item, true)),
+        failure_list: v.failure_list.map(item => parseResult(item, false)),
+        scope: "domain_dns_diagnostic", connectionStatus: "not_reported_by_this_endpoint", countsAsCampaignSend: false,
+        source: "https://developer.instantly.ai/api-reference/account/test-account-vitals",
+      };
+    }, { mutation: true, body: { accounts: [exact] } });
+  }
   async function pauseCampaign(id: string) {
     const result = await request("POST", `/campaigns/${inputId(id)}/pause`, parseCampaign, { mutation: true, body: {} });
     if (result.id !== id || ![0, 2, 3].includes(result.status)) throw new ManagedInstantlyError("Campaign pause was not confirmed.", {
@@ -709,6 +761,7 @@ export function createManagedInstantlyClient(apiKey: string, options: {
       return allPages(cursor => request("GET", "/accounts", v => page(v, parseAccount), { query: { limit: "100", starting_after: cursor } }));
     },
     getAccountHealth,
+    runAccountVitals,
     listCampaigns() {
       return allPages(cursor => request("GET", "/campaigns", v => page(v, parseCampaign), { query: { limit: "100", starting_after: cursor } }));
     },
@@ -791,7 +844,7 @@ export function createManagedInstantlyClient(apiKey: string, options: {
         verify_leads_on_import: false, // Already verified; do not purchase a verification job implicitly.
       } });
     },
-    async activateCampaign(campaignId: string, guard: { preflightCheckedAt: string; expectedRecipientEmail: string }): Promise<ManagedInstantlyCampaign> {
+    async activateCampaign(campaignId: string, guard: { preflightCheckedAt: string; expectedRecipientEmail: string; expectedSenderEmail: string }): Promise<ManagedInstantlyCampaign> {
       const blocked = (message: string): never => { throw new ManagedInstantlyError(message, { code: "launch_blocked" }); };
       const assertFresh = () => {
         const at = Date.parse(guard?.preflightCheckedAt);
@@ -799,11 +852,12 @@ export function createManagedInstantlyClient(apiKey: string, options: {
       };
       assertFresh();
       const expected = inputEmail(guard.expectedRecipientEmail);
+      const sender = inputEmail(guard.expectedSenderEmail);
       const campaign = await getCampaign(campaignId);
       const steps = campaign.sequences?.[0]?.steps;
       if (campaign.id !== campaignId || ![0, 2].includes(campaign.status)
         || campaign.stop_on_reply !== true || campaign.stop_on_auto_reply !== true || campaign.stop_for_company !== true
-        || campaign.email_list?.length !== 1 || campaign.sequences?.length !== 1
+        || campaign.email_list?.length !== 1 || campaign.email_list[0].toLowerCase() !== sender || campaign.sequences?.length !== 1
         || steps?.length !== 1 || steps[0].type !== "email" || steps[0].variants?.length !== 1) {
         blocked("Dispatch requires one paused, one-step campaign with one sender and stop-on-reply protections.");
       }
