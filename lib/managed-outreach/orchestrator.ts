@@ -8,6 +8,7 @@ import { renderManagedEmailContent } from "./email-content";
 import { fingerprintCampaignSequence, planInstantlyFollowup, ManagedInstantlyError,
   type ManagedInstantlyCampaign } from "./instantly";
 import * as store from "./store";
+import { selectManagedStageReceipt } from "./stage-receipts";
 
 export class ManagedDispatchError extends Error {
   constructor(public code: string, message: string, public status = 409, public reasons: string[] = []) {
@@ -202,7 +203,8 @@ export async function dispatchManagedJob(owner: { userId: string; workspaceId: s
   if (job.nextStep === 1 && (await client.listEmails({ leadEmail: job.email })).length) block("existing_contact", "The provider already has message history for this recipient.");
 
   const rendered = renderManagedBody(steps[job.nextStep - 1].body, now(), candidate.recipientTimezone, config.footer);
-  const stagedEvent = events.find(event => event.id === `managed:staged:${job.id}:${job.nextStep}`);
+  const stagedEvent = selectManagedStageReceipt(events, job);
+  let refreshFirstStage = false;
   if (input.action === "activate") {
     if (!stagedEvent || !job.providerCampaignId || !job.sequenceFingerprint) block("not_staged", "Prepare and persist the paused email before activation.");
     const staged = eventData(stagedEvent);
@@ -211,8 +213,9 @@ export async function dispatchManagedJob(owner: { userId: string; workspaceId: s
     validateClearances(input, candidate, now());
   } else if (stagedEvent) {
     const staged = eventData(stagedEvent);
-    if (staged.localDate !== rendered.localDate || staged.bodyHash !== rendered.bodyHash) block("stale_copy", "The already staged copy needs review; it was not silently changed.");
-    return jobResult(job);
+    if (staged.localDate === rendered.localDate && staged.bodyHash === rendered.bodyHash) return jobResult(job);
+    if (job.nextStep !== 1 || events.some(event => ["activation_attempted", "activation_queued", "sent"].includes(event.type))) block("stale_copy", "Only a first draft that has never been activated can be refreshed.");
+    refreshFirstStage = true;
   }
 
   await persistence.markJobReady(job.id, owner.workspaceId, now());
@@ -238,12 +241,25 @@ export async function dispatchManagedJob(owner: { userId: string; workspaceId: s
         attio: input.attioClearance, booking: input.bookingClearance, mailbox: input.mailbox, policyVersion: policy.policyVersion } });
     if (input.action === "stage") {
       let campaign: ManagedInstantlyCampaign;
-      if (job.nextStep === 1) {
+      const refreshCopy = async (expectedLeadCount: 0 | 1) => {
+        if (!campaignId || !job.sequenceFingerprint) block("missing_refresh_proof", "A known paused sequence is required for a copy refresh.");
+        if (events.some(event => ["activation_attempted", "activation_queued", "sent"].includes(event.type))) block("refresh_after_activation", "Never refresh copy after a campaign activation attempt.");
+        const afterFingerprint = fingerprintCampaignSequence({ id: campaignId, name: "", status: 2, sequences: [{ steps: [{ type: "email", delay: 0, variants: [{ subject: steps[0].subject, body: rendered.html }] }] }] });
+        await persistence.upsertEvent({ id: `managed:stage-refresh-intent:${job.id}:${randomUUID()}`, workspaceId: owner.workspaceId, jobId: job.id,
+          type: "stage_refresh_planned", occurredAt: now(), data: { provider: "instantly", campaignId, step: 1, expectedLeadCount,
+            beforeFingerprint: job.sequenceFingerprint, afterFingerprint, previousStageReceiptId: stagedEvent?.id ?? null,
+            bodyHash: rendered.bodyHash, localDate: rendered.localDate, experimentId: job.experimentId, variant: job.variant } });
+        phase = "refresh_paused_first_step"; mutationStarted = true;
+        return client.replacePausedFirstStep(campaignId, { expectedSequenceFingerprint: job.sequenceFingerprint, expectedRecipientEmail: job.email,
+          expectedSenderEmail: job.senderEmail, expectedLeadCount, subject: steps[0].subject, bodyHtml: rendered.html });
+      };
+      if (refreshFirstStage) {
+        campaign = await refreshCopy(1);
+      } else if (job.nextStep === 1) {
         if (campaignId) {
           const authorization = events.find(event => event.id === `managed:stage-resume:${job.id}:1` && event.type === "stage_resume_authorized");
           const proof = authorization ? eventData(authorization) : null;
-          if (!proof || proof.campaignId !== campaignId || proof.sequenceFingerprint !== job.sequenceFingerprint
-            || proof.bodyHash !== rendered.bodyHash || proof.localDate !== rendered.localDate) block("stage_reconciliation_required", "A provider campaign already exists without a complete stage receipt; review it before retrying.");
+          if (!proof || proof.campaignId !== campaignId || proof.sequenceFingerprint !== job.sequenceFingerprint) block("stage_reconciliation_required", "A provider campaign already exists without a complete stage receipt; review it before retrying.");
           phase = "resume_existing_empty_campaign";
           campaign = await client.getCampaign(campaignId);
           if (campaign.id !== campaignId || campaign.name !== `Gather managed ${job.id} ${job.variant}` || campaign.status !== 2
@@ -252,6 +268,7 @@ export async function dispatchManagedJob(owner: { userId: string; workspaceId: s
             || fingerprintCampaignSequence(campaign) !== job.sequenceFingerprint) block("recovery_campaign_changed", "The reviewed empty campaign changed; keep this stage held.");
           if ((await client.listCampaignLeads(campaignId)).length || (await client.listEmails({ campaignId })).length) block("recovery_campaign_nonempty", "The reviewed campaign is no longer empty; no upload was repeated.");
           validateClearances(input, candidate, now(), 300_000);
+          if (proof.bodyHash !== rendered.bodyHash || proof.localDate !== rendered.localDate) campaign = await refreshCopy(0);
         } else {
           mutationStarted = true;
           phase = "create_paused_campaign";
@@ -288,7 +305,8 @@ export async function dispatchManagedJob(owner: { userId: string; workspaceId: s
       }
       const fingerprint = fingerprintCampaignSequence(campaign);
       phase = "persist_stage_receipt";
-      await persistence.upsertEvent({ id: `managed:staged:${job.id}:${job.nextStep}`, workspaceId: owner.workspaceId, jobId: job.id, type: "staged", occurredAt: now(),
+      const stageReceiptId = `managed:staged:${job.id}:${job.nextStep}${refreshFirstStage ? `:refresh:${rendered.localDate}:${rendered.bodyHash}` : ""}`;
+      await persistence.upsertEvent({ id: stageReceiptId, workspaceId: owner.workspaceId, jobId: job.id, type: "staged", occurredAt: now(),
         data: { provider: "instantly", campaignId, step: job.nextStep, experimentId: job.experimentId, variant: job.variant,
           localDate: rendered.localDate, bodyHash: rendered.bodyHash, sequenceFingerprint: fingerprint } });
       const saved = await persistence.updateWithLease(job.id, owner.workspaceId, claimed.leaseToken, { status: "staged", providerCampaignId: campaignId, sequenceFingerprint: fingerprint, lastError: null }, now());

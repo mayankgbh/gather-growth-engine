@@ -950,6 +950,32 @@ export function createManagedInstantlyClient(apiKey: string, options: {
     getEmail,
     appendNextStep,
     activateNextStep,
+    /** Refresh an unsent first email only; never adds a lead or activates. */
+    async replacePausedFirstStep(campaignId: string, input: { expectedSequenceFingerprint: string; expectedRecipientEmail: string;
+      expectedSenderEmail: string; expectedLeadCount: 0 | 1; subject: string; bodyHtml: string }) {
+      const recipient = inputEmail(input.expectedRecipientEmail); const sender = inputEmail(input.expectedSenderEmail);
+      if (![0, 1].includes(input.expectedLeadCount) || !input.subject?.trim() || !input.bodyHtml?.trim()) invalid("Exact first-step refresh inputs are required.");
+      const assertCampaign = (campaign: ManagedInstantlyCampaign, expectedFingerprint: string) => {
+        if (campaign.id !== campaignId || campaign.status !== 2 || campaign.email_list?.length !== 1 || campaign.email_list[0].toLowerCase() !== sender
+          || (campaign.email_tag_list?.length ?? 0) || campaign.stop_on_reply !== true || campaign.stop_on_auto_reply !== true || campaign.stop_for_company !== true
+          || campaign.sequences?.[0]?.steps?.length !== 1 || fingerprintCampaignSequence(campaign) !== expectedFingerprint) blocked("First-step refresh requires the exact paused campaign and unchanged sequence.");
+      };
+      const before = await getCampaign(campaignId); assertCampaign(before, input.expectedSequenceFingerprint);
+      const leads = await listCampaignLeads(campaignId); const lead = leads[0];
+      if (leads.length !== input.expectedLeadCount || (lead && (lead.email?.toLowerCase() !== recipient || lead.campaign !== campaignId || lead.status !== 1
+        || lead.email_reply_count !== 0 || lead.timestamp_last_contact || lead.timestamp_last_reply || [2, 3, 4, -1, -2, -3, -4].includes(lead.lt_interest_status ?? 999)))) blocked("First-step refresh requires the same untouched recipient or a verified empty campaign.");
+      if (await isSuppressed(recipient)) blocked("A suppressed recipient cannot receive refreshed campaign content.");
+      const mail = await Promise.all([allPages(cursor => listEmailsPage({ campaignId }, cursor)), allPages(cursor => listEmailsPage({ leadEmail: recipient }, cursor))]);
+      if (mail.some(items => items.length)) blocked("Message history prevents first-step refresh.");
+      assertCampaign(await getCampaign(campaignId), input.expectedSequenceFingerprint);
+      const sequences: InstantlySequence[] = [{ steps: [{ type: "email", delay: 0, delay_unit: "days", variants: [{ subject: input.subject, body: input.bodyHtml }] }] }];
+      const expected = fingerprintCampaignSequence({ ...before, sequences });
+      await request("PATCH", `/campaigns/${inputId(campaignId)}`, parseCampaign, { mutation: true, body: { sequences } });
+      const after = await getCampaign(campaignId);
+      try { assertCampaign(after, expected); }
+      catch { throw new ManagedInstantlyError("First-step refresh was not confirmed exactly; hold and reconcile.", { code: "invalid_response", outcomeUnknown: true, providerId: campaignId, expectedSequenceFingerprint: expected }); }
+      return after;
+    },
     async createPausedCampaign(input: PausedCampaignInput) {
       if (!input.name?.trim() || !input.subject?.trim() || !input.bodyText?.trim()) invalid("Campaign name, subject and body are required.");
       if (input.bodyHtml !== undefined && (typeof input.bodyHtml !== "string" || !input.bodyHtml.trim())) invalid("Rendered campaign HTML must be nonempty.");

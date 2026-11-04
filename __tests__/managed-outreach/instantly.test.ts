@@ -79,6 +79,26 @@ function followupFixture() {
 }
 
 describe("restricted Instantly adapter", () => {
+  it("refreshes only the exact paused unsent first step and reads back the canonical result", async () => {
+    const h = followupFixture(); h.state.campaign.status = 2; h.state.lead = { ...lead }; h.state.history = [];
+    const expectedSequenceFingerprint = fingerprintCampaignSequence(h.state.campaign);
+    const result = await h.client.replacePausedFirstStep(campaign.id, { expectedSequenceFingerprint, expectedRecipientEmail: address,
+      expectedSenderEmail: "mayank@example.net", expectedLeadCount: 1, subject: "Research", bodyHtml: "Friday or Monday<br/>New draft" });
+    expect(result.sequences![0].steps[0].variants[0].body).toContain("Friday or Monday");
+    const patches = h.fetcher.mock.calls.filter(call => call[1].method === "PATCH");
+    expect(patches).toHaveLength(1); expect(Object.keys(JSON.parse(patches[0][1].body as string))).toEqual(["sequences"]);
+    expect(paths(h.fetcher)).not.toContain(`/api/v2/campaigns/${campaign.id}/activate`);
+    expect(paths(h.fetcher)).not.toContain("/api/v2/leads/add");
+  });
+
+  it.each(["active", "contacted", "history"])("blocks first-step refresh before PATCH for %s evidence", async mode => {
+    const h = followupFixture(); h.state.campaign.status = mode === "active" ? 1 : 2;
+    if (mode !== "contacted") h.state.lead = { ...lead };
+    if (mode !== "history") h.state.history = [];
+    await expect(h.client.replacePausedFirstStep(campaign.id, { expectedSequenceFingerprint: fingerprintCampaignSequence(h.state.campaign),
+      expectedRecipientEmail: address, expectedSenderEmail: "mayank@example.net", expectedLeadCount: 1, subject: "Research", bodyHtml: "New draft" })).rejects.toMatchObject({ code: "launch_blocked" });
+    expect(h.fetcher.mock.calls.filter(call => call[1].method === "PATCH")).toHaveLength(0);
+  });
   it("paginates mailbox inventory and excludes unrelated account configuration", async () => {
     const { client, fetcher } = setup(
       { items: [{ email: "a@example.net", warmup_status: 1, setup_pending: false, smtp_password: "do-not-expose" }], next_starting_after: "created&email" },

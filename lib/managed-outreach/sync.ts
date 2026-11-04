@@ -4,6 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { fingerprintCampaignSequence, type ManagedInstantlyCampaign, type ManagedInstantlyClient, type ManagedInstantlyEmail, type ManagedInstantlyLead } from "./instantly";
 import { createManagedOutreachStore } from "./store";
 import { normalizeEmail } from "./policy";
+import { selectManagedStageReceipt } from "./stage-receipts";
 
 const DAY = 86_400_000;
 const OVERLAP_MS = 2 * DAY;
@@ -116,7 +117,7 @@ function validateSentHistory(job: ManagedOutreachJob, events: ManagedOutreachEve
   const fresh = sent.filter(email => !previousIds.has(email.id));
   evidence(fresh.length <= 1, "ambiguous_outbound_progress");
   if (!fresh.length) return { steps, fresh: null };
-  const staged = events.find(event => event.id === `managed:staged:${job.id}:${job.nextStep}` && event.type === "staged");
+  const staged = selectManagedStageReceipt(events, job);
   const baseReservationId = reservationId(job);
   const reservations = events.filter(event => {
     if (event.type !== "dispatch_reserved" || objectJson(event.dataJson).nextStep !== job.nextStep) return false;

@@ -121,6 +121,17 @@ beforeEach(() => {
 });
 
 describe("managed outreach provider reconciliation", () => {
+  it("matches a versioned refreshed stage receipt while preserving the original", async () => {
+    const original = events.find(event => event.type === "staged")!;
+    const originalData = original.dataJson;
+    providerCampaign.sequences![0].steps[0].variants[0].body = "Refreshed Friday or Monday";
+    jobs[0].sequenceFingerprint = fingerprintCampaignSequence(providerCampaign);
+    const refreshed = stagedEvent(); refreshed.id += `:refresh:2026-11-04:${"a".repeat(64)}`;
+    refreshed.occurredAt = new Date("2026-11-04T18:52:00Z"); events.push(refreshed);
+    const result = await syncManagedOutreach("workspace-a", client, { now });
+    expect(result.complete).toBe(true); expect(events.filter(event => event.type === "sent")).toHaveLength(1);
+    expect(original.dataJson).toBe(originalData);
+  });
   it("records a confirmed send once and schedules the next step from its actual send time", async () => {
     const result = await syncManagedOutreach("workspace-a", client, { now });
     expect(result.newEvents).toHaveLength(1);

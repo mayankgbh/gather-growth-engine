@@ -87,6 +87,49 @@ describe("managed outbound orchestration", () => {
     expect((await equivalent.run()).status).toBe("staged");
   });
 
+  it("resumes only the reviewed existing empty campaign through normal staging gates", async () => {
+    const h = harness(); h.campaign.name = "Gather managed job A";
+    const fingerprint = fingerprintCampaignSequence(h.campaign);
+    h.setJob({ providerCampaignId: h.campaign.id, sequenceFingerprint: fingerprint });
+    const rendered = renderManagedBody(steps[0].body, NOW, candidate.recipientTimezone, config.footer);
+    h.events.push({ id: "managed:stage-resume:job:1", type: "stage_resume_authorized", dataJson: JSON.stringify({ campaignId: h.campaign.id, sequenceFingerprint: fingerprint, bodyHash: rendered.bodyHash, localDate: rendered.localDate }), occurredAt: NOW } as ManagedOutreachEvent);
+    const listCampaignLeads = jest.fn().mockResolvedValue([]);
+    Object.assign(h.client, { listCampaignLeads });
+    expect((await h.run()).status).toBe("staged");
+    expect(listCampaignLeads).toHaveBeenCalledWith(h.campaign.id);
+    expect(h.client.createPausedCampaign).not.toHaveBeenCalled();
+    expect(h.client.uploadVerifiedLead).toHaveBeenCalledTimes(1);
+    expect(h.client.activateCampaign).not.toHaveBeenCalled();
+  });
+
+  it("will not upload during recovery when the existing campaign acquired a lead", async () => {
+    const h = harness(); h.campaign.name = "Gather managed job A";
+    const fingerprint = fingerprintCampaignSequence(h.campaign);
+    h.setJob({ providerCampaignId: h.campaign.id, sequenceFingerprint: fingerprint });
+    const rendered = renderManagedBody(steps[0].body, NOW, candidate.recipientTimezone, config.footer);
+    h.events.push({ id: "managed:stage-resume:job:1", type: "stage_resume_authorized", dataJson: JSON.stringify({ campaignId: h.campaign.id, sequenceFingerprint: fingerprint, bodyHash: rendered.bodyHash, localDate: rendered.localDate }), occurredAt: NOW } as ManagedOutreachEvent);
+    Object.assign(h.client, { listCampaignLeads: jest.fn().mockResolvedValue([{ id: "existing" }]) });
+    await expect(h.run()).rejects.toMatchObject({ code: "recovery_campaign_nonempty" });
+    expect(h.client.uploadVerifiedLead).not.toHaveBeenCalled();
+    expect(h.client.createPausedCampaign).not.toHaveBeenCalled();
+  });
+
+  it("versions an unsent first draft on a new day, then activates using the refreshed receipt", async () => {
+    const h = harness(); await h.run();
+    const original = h.events.find(event => event.type === "staged")!; const originalData = original.dataJson;
+    const tomorrow = new Date("2026-11-05T18:00:00Z"); h.deps.now = () => tomorrow; jest.setSystemTime(tomorrow);
+    const fresh = input(); fresh.mailbox.healthCheckedAt = tomorrow.toISOString(); fresh.attioClearance.checkedAt = tomorrow.toISOString(); fresh.bookingClearance.checkedAt = tomorrow.toISOString();
+    const replacePausedFirstStep = jest.fn(async (_id, next) => { h.campaign.sequences[0].steps[0].variants[0].body = next.bodyHtml; return h.campaign; });
+    Object.assign(h.client, { replacePausedFirstStep });
+    expect((await h.run(fresh)).status).toBe("staged");
+    expect(replacePausedFirstStep).toHaveBeenCalledWith("campaign-1", expect.objectContaining({ expectedLeadCount: 1, bodyHtml: expect.stringContaining("Friday or Monday") }));
+    expect(original.dataJson).toBe(originalData);
+    expect(h.events.filter(event => event.type === "staged")).toHaveLength(2);
+    expect(h.client.uploadVerifiedLead).toHaveBeenCalledTimes(1);
+    expect(h.client.createPausedCampaign).toHaveBeenCalledTimes(1);
+    expect((await h.run({ ...fresh, action: "activate" })).status).toBe("queued");
+  });
+
   it("imports exactly five completed same-subject emails with a selected sender", () => {
     expect(parseManagedImport({ externalId: "p1", candidate, steps, experimentId: "exp", variant: "A", senderEmail: config.senderEmail }, config).steps).toHaveLength(5);
     expect(() => parseManagedImport({ externalId: "p1", candidate, steps: steps.slice(0, 3), experimentId: "exp", variant: "A", senderEmail: config.senderEmail }, config)).toThrow(/five/);
