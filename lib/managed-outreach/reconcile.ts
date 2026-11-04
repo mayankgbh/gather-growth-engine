@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { ManagedOutreachEvent, ManagedOutreachJob } from "@prisma/client";
-import { fingerprintCampaignSequence, type ManagedInstantlyClient } from "./instantly";
+import { fingerprintCampaignSequence, ManagedInstantlyError, type ManagedInstantlyClient } from "./instantly";
 import { parseManagedImport, renderManagedBody, type ManagedDispatchConfig } from "./orchestrator";
 
 function data(event: ManagedOutreachEvent): Record<string, unknown> {
@@ -27,7 +27,12 @@ export async function inspectManagedStage(job: ManagedOutreachJob, events: Manag
     || campaign.email_list?.length !== 1 || campaign.email_list[0].toLowerCase() !== job.senderEmail
     || (campaign.email_tag_list?.length ?? 0) !== 0 || campaign.stop_on_reply !== true || campaign.stop_on_auto_reply !== true || campaign.stop_for_company !== true) reasons.push("Campaign identity, paused status, sender or stop protections differ from the saved stage.");
   let actualFingerprint: string | null = null;
-  try { actualFingerprint = fingerprintCampaignSequence(campaign); } catch { reasons.push("Provider sequence is not a valid managed sequence."); }
+  let sequenceValidationFailure: string | null = null;
+  try { actualFingerprint = fingerprintCampaignSequence(campaign); } catch (error) {
+    // These messages are local validation constants, never a provider response body.
+    sequenceValidationFailure = error instanceof ManagedInstantlyError ? error.message : "Sequence validation failed.";
+    reasons.push("Provider sequence is not a valid managed sequence.");
+  }
   const actualStep = campaign.sequences?.[0]?.steps?.[0];
   if (!job.sequenceFingerprint || actualFingerprint !== job.sequenceFingerprint || campaign.sequences?.[0]?.steps?.length !== 1
     || actualStep?.variants?.[0]?.subject !== saved.steps[0].subject || actualStep?.variants?.[0]?.body !== rendered.html) reasons.push("Provider subject, body or sequence fingerprint differs from the saved draft.");
@@ -43,7 +48,9 @@ export async function inspectManagedStage(job: ManagedOutreachJob, events: Manag
   return { jobId: job.id, status: job.status, providerCampaignId: job.providerCampaignId, reconcilable: reasons.length === 0, reasons,
     checkedAt: new Date().toISOString(), proofFingerprint, stageData,
     campaign: { id: campaign.id, name: campaign.name, status: campaign.status, senderEmails: campaign.email_list, sequenceFingerprint: actualFingerprint,
-      stepCount: campaign.sequences?.[0]?.steps?.length ?? null, subjectMatches: actualStep?.variants?.[0]?.subject === saved.steps[0].subject, bodyMatches: actualStep?.variants?.[0]?.body === rendered.html },
+      stepCount: campaign.sequences?.[0]?.steps?.length ?? null, subjectMatches: actualStep?.variants?.[0]?.subject === saved.steps[0].subject, bodyMatches: actualStep?.variants?.[0]?.body === rendered.html,
+      // Owner-authenticated diagnostics for this job's own outbound copy only.
+      sequences: campaign.sequences, expectedFirstStep: { subject: saved.steps[0].subject, body: rendered.html }, sequenceValidationFailure },
     leads: leads.map(item => ({ id: item.id, email: item.email, campaign: item.campaign, status: item.status, email_reply_count: item.email_reply_count,
       timestamp_last_contact: item.timestamp_last_contact, timestamp_last_reply: item.timestamp_last_reply, lt_interest_status: item.lt_interest_status })),
     messageReceipts: messages.map(item => ({ id: item.id, message_id: item.message_id, timestamp_created: item.timestamp_created, ue_type: item.ue_type, campaign_id: item.campaign_id })),
