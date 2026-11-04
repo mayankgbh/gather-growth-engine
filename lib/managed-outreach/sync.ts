@@ -1,4 +1,4 @@
-import { createHash } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import type { ManagedOutreachEvent, ManagedOutreachJob, Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { fingerprintCampaignSequence, type ManagedInstantlyCampaign, type ManagedInstantlyClient, type ManagedInstantlyEmail, type ManagedInstantlyLead } from "./instantly";
@@ -279,7 +279,25 @@ export async function syncManagedOutreach(workspaceId: string, client: ManagedIn
               : stop ? "Incoming reply requires human review before further outreach." : SYNC_FAILURE,
           } });
         }
-        return { freshEvents, problems: Array.from(new Set(problems)), pause, suppress: unsubscribed, deferred: activeWorker };
+        let completedPause: { token: string; fingerprint: string; stepCount: number; eventId: string } | null = null;
+        const stepCount = campaign?.sequences?.[0]?.steps?.length ?? 0;
+        // Release the sender after all provider-present steps have immutable send
+        // proof. A short lease prevents our dispatch worker appending an unsent step
+        // between this proof and the operational pause. Progress remains held/completed.
+        if (!pause && !activeWorker && progress && campaign?.status === 1 && exactLead?.status === 3 && stepCount > 0
+          && sent?.length === stepCount && (progress.fresh ? current.nextStep : current.nextStep - 1) === stepCount) {
+          const token = randomUUID(); const eventId = `instantly:completed-pause:${current.id}:${token}`;
+          const claimed = await tx.managedOutreachJob.updateMany({ where: { id: current.id, workspaceId,
+            status: { in: ["held", "completed"] }, nextStep: stepCount + 1, sequenceFingerprint: current.sequenceFingerprint,
+            leaseToken: null, leaseUntil: null }, data: { leaseToken: token, leaseUntil: new Date(now.getTime() + 60_000) } });
+          if (claimed.count === 1) {
+            completedPause = { token, fingerprint: current.sequenceFingerprint!, stepCount, eventId };
+            await store.upsertEvent({ id: eventId, workspaceId, jobId: current.id, type: "completed_steps_pause_planned", occurredAt: now,
+              data: { provider: "instantly", campaignId: current.providerCampaignId, sequenceFingerprint: current.sequenceFingerprint,
+                completedStepCount: stepCount, sentEmailIds: sent.map(email => email.id), purpose: "release_sender_between_managed_steps" } });
+          }
+        }
+        return { freshEvents, problems: Array.from(new Set(problems)), pause, completedPause, suppress: unsubscribed, deferred: activeWorker };
       }, { maxWait: 10_000, timeout: 15_000 });
       result.newEvents.push(...effects.freshEvents);
       for (const code of effects.problems) fail(job.id, code);
@@ -288,6 +306,29 @@ export async function syncManagedOutreach(workspaceId: string, client: ManagedIn
       if (shouldPause) {
         try { await client.pauseCampaign(job.providerCampaignId!); }
         catch { fail(job.id, "provider_pause_unconfirmed"); }
+      }
+      if (effects.completedPause) {
+        const planned = effects.completedPause;
+        try {
+          const current = await prisma.managedOutreachJob.findFirst({ where: { id: job.id, workspaceId, leaseToken: planned.token } });
+          evidence(current && current.sequenceFingerprint === planned.fingerprint && current.nextStep === planned.stepCount + 1, "completed_pause_job_changed");
+          const [actual, actualLeads] = await Promise.all([client.getCampaign(job.providerCampaignId!), client.listCampaignLeads(job.providerCampaignId!)]);
+          evidence(actual.id === job.providerCampaignId && fingerprintCampaignSequence(actual) === planned.fingerprint
+            && actual.sequences?.[0]?.steps.length === planned.stepCount && [1, 2, 3].includes(actual.status)
+            && actualLeads.length === 1 && recipient(actualLeads[0].email) === job.email && actualLeads[0].campaign === job.providerCampaignId
+            && actualLeads[0].status === 3, "completed_pause_provider_changed");
+          const paused = actual.status === 1 ? await client.pauseCampaign(job.providerCampaignId!) : actual;
+          evidence(paused.id === job.providerCampaignId && [2, 3].includes(paused.status)
+            && fingerprintCampaignSequence(paused) === planned.fingerprint, "completed_pause_unconfirmed");
+          await createManagedOutreachStore().upsertEvent({ id: `${planned.eventId}:confirmed`, workspaceId, jobId: job.id,
+            type: "completed_steps_paused", occurredAt: now, data: { provider: "instantly", campaignId: job.providerCampaignId,
+              sequenceFingerprint: planned.fingerprint, completedStepCount: planned.stepCount, providerStatus: paused.status,
+              intentEventId: planned.eventId, dispatchStatusUnchanged: true } });
+        } catch { fail(job.id, "completed_steps_pause_unconfirmed"); }
+        finally {
+          try { await prisma.managedOutreachJob.updateMany({ where: { id: job.id, workspaceId, leaseToken: planned.token }, data: { leaseToken: null, leaseUntil: null } }); }
+          catch { fail(job.id, "completed_steps_pause_lease_release_failed"); }
+        }
       }
       if (effects.suppress) {
         try {

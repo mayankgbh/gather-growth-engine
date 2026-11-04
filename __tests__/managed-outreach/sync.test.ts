@@ -121,6 +121,42 @@ beforeEach(() => {
 });
 
 describe("managed outreach provider reconciliation", () => {
+  it("operationally pauses a still-active campaign after all present steps are proven sent", async () => {
+    providerCampaign.status = 1;
+    const result = await syncManagedOutreach("workspace-a", client, { now });
+    expect(result.complete).toBe(true);
+    expect(client.pauseCampaign).toHaveBeenCalledWith("campaign-a");
+    expect(jobs[0]).toMatchObject({ status: "held", nextStep: 2, dueAt: new Date(sentAt.getTime() + 3 * 86_400_000), leaseToken: null, leaseUntil: null });
+    expect(events.filter(event => event.type === "sent")).toHaveLength(1);
+    expect(events.filter(event => event.type === "completed_steps_paused")).toHaveLength(1);
+  });
+
+  it("also releases the sender on a later scan when the send receipt was already persisted", async () => {
+    await syncManagedOutreach("workspace-a", client, { now });
+    providerCampaign.status = 1;
+    const result = await syncManagedOutreach("workspace-a", client, { now });
+    expect(result.complete).toBe(true); expect(result.newEvents).toHaveLength(0);
+    expect(client.pauseCampaign).toHaveBeenCalledTimes(1);
+    expect(jobs[0].status).toBe("held"); expect(jobs[0].nextStep).toBe(2);
+  });
+
+  it("does not operationally pause when an approved unsent step exists", async () => {
+    await syncManagedOutreach("workspace-a", client, { now });
+    providerCampaign = campaign(2); providerCampaign.status = 1;
+    jobs[0].sequenceFingerprint = fingerprintCampaignSequence(providerCampaign); jobs[0].status = "queued";
+    events.push(stagedEvent(2), dispatchReservation(2));
+    const result = await syncManagedOutreach("workspace-a", client, { now });
+    expect(result.complete).toBe(true); expect(client.pauseCampaign).not.toHaveBeenCalled();
+    expect(jobs[0].status).toBe("queued");
+  });
+
+  it("reports operational pause failure without changing verified progress to stopped or uncertain", async () => {
+    providerCampaign.status = 1; (client.pauseCampaign as jest.Mock).mockRejectedValueOnce(new Error("provider unavailable"));
+    const result = await syncManagedOutreach("workspace-a", client, { now });
+    expect(result.failures).toEqual([expect.objectContaining({ code: "completed_steps_pause_unconfirmed" })]);
+    expect(jobs[0]).toMatchObject({ status: "held", nextStep: 2, leaseToken: null, leaseUntil: null });
+    expect(events.filter(event => event.type === "completed_steps_paused")).toHaveLength(0);
+  });
   it("matches a versioned refreshed stage receipt while preserving the original", async () => {
     const original = events.find(event => event.type === "staged")!;
     const originalData = original.dataJson;
