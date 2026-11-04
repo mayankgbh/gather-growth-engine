@@ -77,6 +77,7 @@ export type ManagedInstantlyCampaign = {
   name: string;
   status: number; // 0 draft, 1 active, 2 paused, 3 completed, 4 subsequences.
   email_list?: string[];
+  email_tag_list?: string[];
   stop_on_reply?: boolean | null;
   stop_on_auto_reply?: boolean | null;
   stop_for_company?: boolean | null;
@@ -148,6 +149,8 @@ export type PausedCampaignInput = {
   senderEmails: string[];
   subject: string;
   bodyText: string;
+  /** Trusted server-rendered HTML, never an inbound message or caller-supplied fragment. */
+  bodyHtml?: string;
   timezone?: "America/Detroit" | "America/Chicago" | "America/Boise" | "America/Dawson" | "America/Anchorage" | "America/Creston" | "Etc/GMT+10";
   /** Explicit supported-zone hours; caller may convert verified recipient-local hours. */
   timing?: { from: string; to: string };
@@ -179,6 +182,7 @@ export type InstantlyFollowupProof = {
 };
 export type AppendInstantlyStepInput = InstantlyFollowupProof & {
   bodyText: string;
+  bodyHtml?: string;
   /** Native delay from the preceding step's actual send, not from append time. */
   delayDays: number;
 };
@@ -186,6 +190,13 @@ export type InstantlyFollowupPlan = {
   sequences: InstantlySequence[];
   sequenceFingerprint: string;
   nextStep: number;
+};
+export type InstantlyAccountCampaignMapping = {
+  campaign_id: string; campaign_name: string; timestamp_created: string; status: number;
+};
+export type InstantlySenderRemovalPlan = {
+  campaignId: string; campaignName: string; status: number; senderEmail: string;
+  before: string[]; after: string[]; fingerprint: string; alreadyAbsent: boolean;
 };
 export type InstantlyAccountHealth = {
   observedAt: string;
@@ -270,10 +281,11 @@ export function fingerprintCampaignSequence(campaign: ManagedInstantlyCampaign):
 
 /** Pure plan: callers can persist the intended new fingerprint BEFORE a provider mutation. */
 export function planInstantlyFollowup(campaign: ManagedInstantlyCampaign, input: {
-  expectedSequenceFingerprint: string; bodyText: string; delayDays: number;
+  expectedSequenceFingerprint: string; bodyText: string; bodyHtml?: string; delayDays: number;
 }): InstantlyFollowupPlan {
   if (fingerprintCampaignSequence(campaign) !== input.expectedSequenceFingerprint) blocked("The provider sequence changed; do not append to an unrecognized sequence.");
   if (typeof input.bodyText !== "string" || !input.bodyText.trim()) invalid("Followup text is required.");
+  if (input.bodyHtml !== undefined && (typeof input.bodyHtml !== "string" || !input.bodyHtml.trim())) invalid("Rendered followup HTML must be nonempty.");
   if (!Number.isInteger(input.delayDays) || input.delayDays < 1 || input.delayDays > 30) invalid("A followup interval of 1–30 days is required.");
   const sequences = JSON.parse(JSON.stringify(campaign.sequences)) as InstantlySequence[];
   const steps = sequences[0].steps;
@@ -281,8 +293,28 @@ export function planInstantlyFollowup(campaign: ManagedInstantlyCampaign, input:
   // The only change to a completed step is its documented wait before NEXT email.
   steps[steps.length - 1].delay = input.delayDays;
   steps[steps.length - 1].delay_unit = "days";
-  steps.push({ type: "email", delay: 0, delay_unit: "days", variants: [{ subject: "", body: textToHtml(input.bodyText) }] });
+  steps.push({ type: "email", delay: 0, delay_unit: "days", variants: [{ subject: "", body: input.bodyHtml ?? textToHtml(input.bodyText) }] });
   return { sequences, sequenceFingerprint: fingerprintCampaignSequence({ ...campaign, sequences }), nextStep: steps.length };
+}
+
+/** Reviewable exact removal; no other campaign settings are part of the PATCH. */
+export function planInstantlySenderRemoval(campaign: ManagedInstantlyCampaign, senderEmail: string): InstantlySenderRemovalPlan {
+  const exact = inputEmail(senderEmail);
+  if (!Array.isArray(campaign.email_list) || campaign.email_list.length > 10_000
+    || campaign.email_list.some(email => typeof email !== "string" || inputEmail(email) !== email.toLowerCase())
+    || new Set(campaign.email_list.map(email => email.toLowerCase())).size !== campaign.email_list.length) {
+    blocked("Campaign sender assignments are incomplete or ambiguous.");
+  }
+  if (campaign.email_tag_list !== undefined && (!Array.isArray(campaign.email_tag_list) || campaign.email_tag_list.length)) {
+    blocked("Tag-based sender assignments require separate review; removing a direct assignment would not reserve the mailbox.");
+  }
+  const before = [...campaign.email_list];
+  const after = before.filter(email => email.toLowerCase() !== exact);
+  if (after.length !== before.length && !after.length) blocked("The mailbox is the campaign's only sender; do not disable that campaign implicitly.");
+  return { campaignId: campaign.id, campaignName: campaign.name, status: campaign.status, senderEmail: exact,
+    before, after, alreadyAbsent: before.length === after.length,
+    fingerprint: createHash("sha256").update(canonicalJson({ id: campaign.id, name: campaign.name, status: campaign.status,
+      email_list: before, email_tag_list: campaign.email_tag_list ?? [] })).digest("hex") };
 }
 
 function textToHtml(value: string): string {
@@ -460,6 +492,42 @@ export function createManagedInstantlyClient(apiKey: string, options: {
   }
   function getCampaign(id: string) {
     return request("GET", `/campaigns/${inputId(id)}`, parseCampaign);
+  }
+  function listAccountCampaigns(email: string) {
+    const exact = inputEmail(email);
+    return allPages(cursor => request("GET", `/account-campaign-mappings/${encodeURIComponent(exact)}`, value => page(value, item => {
+      const row = object(item);
+      return { campaign_id: string(row.campaign_id), campaign_name: string(row.campaign_name),
+        timestamp_created: timestamp(row.timestamp_created), status: numeric(row.status) };
+    }), { query: { limit: "100", starting_after: cursor } }));
+  }
+  async function removeSenderFromCampaign(campaignId: string, senderEmail: string, expectedFingerprint: string,
+    beforeMutation: (plan: InstantlySenderRemovalPlan) => Promise<void>) {
+    if (!/^[a-f0-9]{64}$/.test(expectedFingerprint) || typeof beforeMutation !== "function") invalid("A saved exact removal plan and durable audit callback are required.");
+    const campaign = await getCampaign(campaignId);
+    if (campaign.id !== campaignId) blocked("Campaign identity did not match the requested provider ID.");
+    const plan = planInstantlySenderRemoval(campaign, senderEmail);
+    if (plan.fingerprint !== expectedFingerprint) blocked("Campaign assignments changed since review; fetch a fresh removal plan.");
+    if (plan.alreadyAbsent) return { ...plan, outcome: "already_absent" as const, checkedAt: new Date().toISOString() };
+    await beforeMutation(plan); // Fail closed if the attempted mutation cannot be saved.
+    // Re-read AFTER saving the intent. Do not apply a stale sender-array snapshot.
+    const latest = await getCampaign(campaignId);
+    if (planInstantlySenderRemoval(latest, senderEmail).fingerprint !== expectedFingerprint) blocked("Campaign assignments changed before removal; no PATCH was requested.");
+    let patchAccepted = false;
+    try {
+      await request("PATCH", `/campaigns/${inputId(campaignId)}`, parseCampaign, { mutation: true, body: { email_list: plan.after } });
+      patchAccepted = true;
+      const confirmed = await getCampaign(campaignId);
+      const observed = planInstantlySenderRemoval(confirmed, senderEmail);
+      if (confirmed.id !== campaignId || confirmed.status !== latest.status || confirmed.name !== latest.name
+        || canonicalJson(observed.before) !== canonicalJson(plan.after)) throw new ManagedInstantlyError("Sender removal was not confirmed exactly; inspect provider state before retrying.", { code: "invalid_response", outcomeUnknown: true });
+      return { ...plan, outcome: "removed" as const, checkedAt: new Date().toISOString() };
+    } catch (error) {
+      if (error instanceof ManagedInstantlyError && !patchAccepted) throw error;
+      throw new ManagedInstantlyError("Sender removal may have been applied; reconcile the saved campaign and assignment evidence before retrying.", {
+        code: error instanceof ManagedInstantlyError ? error.code : "provider_error", outcomeUnknown: true, providerId: campaignId,
+      });
+    }
   }
   async function getAccountHealth(email: string, window: { startDate: string; endDate: string }): Promise<InstantlyAccountHealth> {
     const exact = inputEmail(email);
@@ -766,6 +834,8 @@ export function createManagedInstantlyClient(apiKey: string, options: {
       return allPages(cursor => request("GET", "/campaigns", v => page(v, parseCampaign), { query: { limit: "100", starting_after: cursor } }));
     },
     getCampaign,
+    listAccountCampaigns,
+    removeSenderFromCampaign,
     pauseCampaign,
     listCampaignLeads,
     listBlocklist,
@@ -802,11 +872,12 @@ export function createManagedInstantlyClient(apiKey: string, options: {
     activateNextStep,
     async createPausedCampaign(input: PausedCampaignInput) {
       if (!input.name?.trim() || !input.subject?.trim() || !input.bodyText?.trim()) invalid("Campaign name, subject and body are required.");
+      if (input.bodyHtml !== undefined && (typeof input.bodyHtml !== "string" || !input.bodyHtml.trim())) invalid("Rendered campaign HTML must be nonempty.");
       if (!Array.isArray(input.senderEmails) || input.senderEmails.length !== 1) invalid("Exactly one explicit sending account is required.");
       const senders = input.senderEmails.map(inputEmail);
       const timing = input.timing ?? { from: "09:00", to: "16:00" };
       if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(timing.from) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(timing.to) || timing.from >= timing.to) invalid("An ordered, same-day HH:mm sending window is required.");
-      const html = input.bodyText.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\r?\n/g, "<br/>");
+      const html = input.bodyHtml ?? textToHtml(input.bodyText);
       const campaign = await request("POST", "/campaigns", parseCampaign, { mutation: true, body: {
         name: input.name, email_list: senders,
         campaign_schedule: { schedules: [{ name: "US business hours", timing,
@@ -816,7 +887,7 @@ export function createManagedInstantlyClient(apiKey: string, options: {
         daily_limit: 1, daily_max_leads: 1, email_gap: 15, random_wait_max: 0,
         stop_on_reply: true, stop_on_auto_reply: true, stop_for_company: true,
         insert_unsubscribe_header: true, allow_risky_contacts: false, disable_bounce_protect: false,
-        text_only: true, first_email_text_only: true, open_tracking: false, link_tracking: false,
+        text_only: input.bodyHtml === undefined, first_email_text_only: input.bodyHtml === undefined, open_tracking: false, link_tracking: false,
       } });
       // status is read-only in CreateCampaign, so never send a fictitious status:2.
       // Explicitly pause and confirm before any lead can be added.

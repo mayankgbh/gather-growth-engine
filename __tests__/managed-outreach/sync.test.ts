@@ -128,7 +128,8 @@ describe("managed outreach provider reconciliation", () => {
     expect(sent).toHaveLength(1);
     expect(sent[0]).toMatchObject({ id: "instantly:sent:provider-email-a", providerMessageId: "provider-email-a", occurredAt: sentAt });
     expect(JSON.parse(sent[0].dataJson)).toMatchObject({ provider: "instantly", campaignId: "campaign-a", threadId: "thread-a",
-      senderEmail: "sender@example.org", recipientEmail: "person@example.com", step: 1, experimentId: "experiment-a", variant: "A" });
+      senderEmail: "sender@example.org", recipientEmail: "person@example.com", step: 1, experimentId: "experiment-a", variant: "A",
+      subject: "Example subject", bodyText: "Example body 1", bodyHtml: null });
     expect(jobs[0]).toMatchObject({ nextStep: 2, dueAt: new Date(sentAt.getTime() + 3 * 86_400_000) });
     expect((await syncManagedOutreach("workspace-a", client, { now })).newEvents).toHaveLength(0);
     expect(events.filter(event => event.type === "sent")).toHaveLength(1);

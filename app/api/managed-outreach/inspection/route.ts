@@ -32,7 +32,9 @@ export async function GET(request: Request) {
     const accounts = await client.listAccounts();
     if (!accounts.some(a => a.email.toLowerCase() === senderEmail)) return NextResponse.json({ error: "Sender is not in this workspace's account inventory." }, { status: 404, headers });
     const endDate = new Date().toISOString().slice(0, 10);
-    const startDate = new Date(Date.now() - 14 * 86_400_000).toISOString().slice(0, 10);
+    // Use a complete 31-day request window so low-volume mailboxes can provide
+    // enough actual sending-day observations. Missing dates remain unknown.
+    const startDate = new Date(Date.now() - 30 * 86_400_000).toISOString().slice(0, 10);
     const results = await Promise.allSettled([
       client.getAccountHealth(senderEmail, { startDate, endDate }),
       client.listCampaigns(),

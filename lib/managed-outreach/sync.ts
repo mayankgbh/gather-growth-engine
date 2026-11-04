@@ -248,6 +248,7 @@ export async function syncManagedOutreach(workspaceId: string, client: ManagedIn
               provider: "instantly", campaignId: current.providerCampaignId, threadId: email.thread_id,
               senderEmail: current.senderEmail, recipientEmail: current.email, step: current.nextStep,
               experimentId: current.experimentId, variant: current.variant, source: "provider-email", rfcMessageId: email.message_id,
+              subject: email.subject, bodyText: email.body.text ?? null, bodyHtml: email.body.html ?? null,
             } });
           const nextStep = current.nextStep + 1;
           const next = progress.steps[nextStep - 1];

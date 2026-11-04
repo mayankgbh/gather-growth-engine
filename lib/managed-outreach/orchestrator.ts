@@ -2,8 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import type { ManagedOutreachEvent, ManagedOutreachJob } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { getManagedInstantlyClientForUserId } from "./client";
-import { buildFooter, evaluateCandidate, evaluateSendPolicy, normalizeDomain, normalizeEmail, sameCorporateDomain,
+import { evaluateCandidate, evaluateSendPolicy, normalizeDomain, normalizeEmail, sameCorporateDomain,
   type Candidate, type FooterConfig, type MailboxReadiness } from "./policy";
+import { renderManagedEmailContent } from "./email-content";
 import { fingerprintCampaignSequence, planInstantlyFollowup, ManagedInstantlyError,
   type ManagedInstantlyCampaign } from "./instantly";
 import * as store from "./store";
@@ -101,7 +102,9 @@ export function renderManagedBody(template: string, now: Date, timezone: string,
     day.setUTCDate(day.getUTCDate() + 1);
     if (![0, 6].includes(day.getUTCDay())) choices.push(new Intl.DateTimeFormat("en-US", { weekday: "long", timeZone: "UTC" }).format(day));
   }
-  return { body: `${template.replace(/{{meeting_days}}/g, choices.join(" or "))}\n\n${buildFooter(footer)}`, localDate: local.date };
+  const rendered = renderManagedEmailContent(template.replace(/{{meeting_days}}/g, choices.join(" or ")), footer);
+  return { ...rendered, localDate: local.date,
+    bodyHash: createHash("sha256").update(JSON.stringify([rendered.body, rendered.html])).digest("hex") };
 }
 
 export function validateClearances(input: Pick<ManagedDispatchInput, "attioClearance" | "bookingClearance">, candidate: Candidate, now: Date, maxAge = 60_000) {
@@ -203,12 +206,12 @@ export async function dispatchManagedJob(owner: { userId: string; workspaceId: s
   if (input.action === "activate") {
     if (!stagedEvent || !job.providerCampaignId || !job.sequenceFingerprint) block("not_staged", "Prepare and persist the paused email before activation.");
     const staged = eventData(stagedEvent);
-    if (staged.localDate !== rendered.localDate || staged.bodyHash !== createHash("sha256").update(rendered.body).digest("hex")) block("stale_copy", "The staged meeting-day copy needs review before activation on a different day.");
+    if (staged.localDate !== rendered.localDate || staged.bodyHash !== rendered.bodyHash) block("stale_copy", "The staged meeting-day copy needs review before activation on a different day.");
     // No new timestamp is invented after potentially slow provider inventory checks.
     validateClearances(input, candidate, now());
   } else if (stagedEvent) {
     const staged = eventData(stagedEvent);
-    if (staged.localDate !== rendered.localDate || staged.bodyHash !== createHash("sha256").update(rendered.body).digest("hex")) block("stale_copy", "The already staged copy needs review; it was not silently changed.");
+    if (staged.localDate !== rendered.localDate || staged.bodyHash !== rendered.bodyHash) block("stale_copy", "The already staged copy needs review; it was not silently changed.");
     return jobResult(job);
   }
 
@@ -238,7 +241,7 @@ export async function dispatchManagedJob(owner: { userId: string; workspaceId: s
         mutationStarted = true;
         // Provider timezone governs delivery; the preflight window already uses the recorded recipient timezone.
         campaign = await client.createPausedCampaign({ name: `Gather managed ${job.id} ${job.variant}`, senderEmails: [job.senderEmail],
-          subject: steps[0].subject, bodyText: rendered.body, ...providerSchedule(now(), candidate.recipientTimezone) });
+          subject: steps[0].subject, bodyText: rendered.body, bodyHtml: rendered.html, ...providerSchedule(now(), candidate.recipientTimezone) });
         campaignId = campaign.id;
         await persistence.updateWithLease(job.id, owner.workspaceId, claimed.leaseToken, { providerCampaignId: campaignId, sequenceFingerprint: fingerprintCampaignSequence(campaign) }, now());
         const uploaded = await client.uploadVerifiedLead(campaignId, { email: job.email, companyName: candidate.company,
@@ -248,17 +251,17 @@ export async function dispatchManagedJob(owner: { userId: string; workspaceId: s
         if (!campaignId) block("missing_campaign", "A threaded followup requires the original provider campaign.");
         const proof = priorProof(job, events);
         const before = await client.getCampaign(campaignId);
-        const plan = planInstantlyFollowup(before, { expectedSequenceFingerprint: proof.expectedSequenceFingerprint, bodyText: rendered.body, delayDays: steps[job.nextStep - 1].delayDays });
+        const plan = planInstantlyFollowup(before, { expectedSequenceFingerprint: proof.expectedSequenceFingerprint, bodyText: rendered.body, bodyHtml: rendered.html, delayDays: steps[job.nextStep - 1].delayDays });
         await persistence.upsertEvent({ id: `managed:append-intent:${job.id}:${job.nextStep}`, workspaceId: owner.workspaceId, jobId: job.id, type: "append_planned", occurredAt: now(),
           data: { campaignId, beforeFingerprint: proof.expectedSequenceFingerprint, afterFingerprint: plan.sequenceFingerprint, step: job.nextStep } });
         mutationStarted = true;
-        const appended = await client.appendNextStep(campaignId, { ...proof, bodyText: rendered.body, delayDays: steps[job.nextStep - 1].delayDays });
+        const appended = await client.appendNextStep(campaignId, { ...proof, bodyText: rendered.body, bodyHtml: rendered.html, delayDays: steps[job.nextStep - 1].delayDays });
         campaign = appended.campaign;
       }
       const fingerprint = fingerprintCampaignSequence(campaign);
       await persistence.upsertEvent({ id: `managed:staged:${job.id}:${job.nextStep}`, workspaceId: owner.workspaceId, jobId: job.id, type: "staged", occurredAt: now(),
         data: { provider: "instantly", campaignId, step: job.nextStep, experimentId: job.experimentId, variant: job.variant,
-          localDate: rendered.localDate, bodyHash: createHash("sha256").update(rendered.body).digest("hex"), sequenceFingerprint: fingerprint } });
+          localDate: rendered.localDate, bodyHash: rendered.bodyHash, sequenceFingerprint: fingerprint } });
       const saved = await persistence.updateWithLease(job.id, owner.workspaceId, claimed.leaseToken, { status: "staged", providerCampaignId: campaignId, sequenceFingerprint: fingerprint, lastError: null }, now());
       return jobResult(saved);
     }
@@ -313,7 +316,19 @@ export function providerSchedule(now: Date, timezone: ManagedCandidate["recipien
 }
 
 export function safeManagedJob(job: ManagedOutreachJob) {
+  let candidate: Record<string, unknown> = {};
+  try { candidate = object(JSON.parse(job.candidateJson)); } catch { /* Invalid saved context is returned as unknown, never inferred. */ }
+  const savedText = (value: unknown) => typeof value === "string" && value.trim() && value.length <= 250 ? value.trim() : null;
+  const savedList = (value: unknown) => value === undefined ? []
+    : Array.isArray(value) && value.length <= 100 && value.every(item => savedText(item)) ? value.map(item => savedText(item)!) : null;
+  const recipientTimezone = typeof candidate.recipientTimezone === "string" && RECIPIENT_TIMEZONES.includes(candidate.recipientTimezone as ManagedCandidate["recipientTimezone"])
+    ? candidate.recipientTimezone : null;
+  const company = savedText(candidate.company); const title = savedText(candidate.title);
+  const segment = candidate.segment === "cmo" || candidate.segment === "agency" ? candidate.segment : null;
+  const corporateDomains = savedList(candidate.corporateDomains); const corporateNames = savedList(candidate.corporateNames);
   return { jobId: job.id, externalId: job.externalId, email: job.email, companyDomain: job.companyDomain, senderEmail: job.senderEmail,
+    recipientTimezone, company, title, segment, corporateDomains, corporateNames,
+    candidateContextComplete: Boolean(recipientTimezone && company && title && segment && corporateDomains && corporateNames),
     status: job.status, nextStep: job.nextStep, dueAt: job.dueAt?.toISOString() ?? null, providerCampaignId: job.providerCampaignId,
     experimentId: job.experimentId, variant: job.variant, lastError: job.lastError, createdAt: job.createdAt.toISOString(), updatedAt: job.updatedAt.toISOString() };
 }

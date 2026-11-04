@@ -115,6 +115,20 @@ describe("durable incoming reply classification", () => {
     expect(getClient).not.toHaveBeenCalled();
   });
 
+  it.each(["no thanks", "No thanks!", "no thank you", "No thank you."])("honors the footer's exact standalone opening opt-out: %s", async phrase => {
+    events[0].dataJson = JSON.stringify(incomingData({ bodyExcerpt: `\n${phrase}\n\nOn Wednesday, the sender wrote:\nOriginal message` }));
+    const result = await classifyManagedReply("workspace-a", { ...optOut, evidenceQuote: phrase }, opts());
+    expect(result).toMatchObject({ status: "suppressed", suppressionStatus: "confirmed" });
+    expect(suppressEmail).toHaveBeenCalledWith("actual@example.com");
+  });
+
+  it.each(["no thanks needed", "they said no thanks", "> no thanks", "Thanks for the information.\n\nno thanks"])("does not treat a courtesy phrase inside prose or quoted history as an opt-out: %s", async bodyExcerpt => {
+    events[0].dataJson = JSON.stringify(incomingData({ bodyExcerpt }));
+    await expect(classifyManagedReply("workspace-a", { ...optOut, evidenceQuote: "no thanks" }, opts())).rejects.toMatchObject({ code: "invalid_opt_out_evidence" });
+    expect(getClient).not.toHaveBeenCalled();
+    expect(events).toHaveLength(1);
+  });
+
   it("suppresses only the durable actual sender and only marks suppression after confirmation", async () => {
     suppressEmail.mockImplementation(async () => {
       expect(job.status).toBe("held");

@@ -1,4 +1,4 @@
-import { dispatchManagedJob, isRecipientBusinessWindow, parseManagedImport, providerSchedule, renderManagedBody, validateClearances,
+import { dispatchManagedJob, isRecipientBusinessWindow, parseManagedImport, providerSchedule, renderManagedBody, safeManagedJob, validateClearances,
   type ManagedCandidate, type ManagedDispatchConfig, type ManagedDispatchInput } from "@/lib/managed-outreach/orchestrator";
 import { fingerprintCampaignSequence, ManagedInstantlyError } from "@/lib/managed-outreach/instantly";
 import type { ManagedOutreachEvent, ManagedOutreachJob } from "@prisma/client";
@@ -64,6 +64,17 @@ describe("managed outbound orchestration", () => {
     expect(() => parseManagedImport({ externalId: "p1", candidate, steps, experimentId: "exp", variant: "A", senderEmail: "other@example.com" }, config)).toThrow(/exact configured/);
   });
 
+  it("returns only saved scheduling and corporate identity context, with malformed context held as unknown", () => {
+    const h = harness();
+    h.setJob({ candidateJson: JSON.stringify({ ...candidate, corporateDomains: ["other.example.com"], corporateNames: ["Other Example"], apiKey: "must not leak" }) });
+    const safe = safeManagedJob(h.getJob());
+    expect(safe).toMatchObject({ recipientTimezone: "America/New_York", company: "Example", title: "Chief Marketing Officer", segment: "cmo",
+      corporateDomains: ["other.example.com"], corporateNames: ["Other Example"], candidateContextComplete: true });
+    expect(JSON.stringify(safe)).not.toContain("must not leak");
+    h.setJob({ candidateJson: "not JSON" });
+    expect(safeManagedJob(h.getJob())).toMatchObject({ recipientTimezone: null, company: null, title: null, segment: null, candidateContextComplete: false });
+  });
+
   it("rejects stale, incomplete or wrong-identity CRM and booking clearances before provider access", async () => {
     for (const patch of [
       { attioClearance: { ...input().attioClearance, checkedAt: "2026-11-03T18:00:00Z" } },
@@ -91,6 +102,8 @@ describe("managed outbound orchestration", () => {
     expect(updateCall).toBeLessThan(uploadCall);
     expect(h.events.some(event => event.type === "sent")).toBe(false);
     expect(h.client.createPausedCampaign.mock.calls[0][0].bodyText).toContain("Thursday or Friday");
+    expect(h.client.createPausedCampaign.mock.calls[0][0].bodyHtml).toContain("font-size:12px");
+    expect(h.client.createPausedCampaign.mock.calls[0][0].bodyHtml).toContain(config.footer.businessPostalAddress);
   });
 
   it("permits paused staging while the sending switch is disabled", async () => {

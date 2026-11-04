@@ -77,8 +77,15 @@ function checkOptOut(input: ManagedReplyInput, source: Source) {
   const quote = input.evidenceQuote!;
   // This validates the owner's explicit classification; incoming text never acts as executable instructions.
   const stopRequest = /\b(?:unsubscribe(?:\s+me)?|remove\s+me|take\s+me\s+off|opt[ -]?out|stop\s+(?:contacting|emailing|e-mailing|sending|messaging|reaching\s+out)|(?:do\s+not|don['’]t)\s+(?:contact|email|e-mail|send|message)|no\s+more\s+(?:emails?|messages?|contact))\b/i;
+  // The campaign footer explicitly offers "no thanks" as a stop command. Only
+  // accept that exact standalone opening response, never a mention in prose,
+  // quoted history or the outgoing footer embedded farther down the message.
+  const courtesyStop = /^no[ \t]+(?:thanks|thank[ \t]+you)[.!?]*$/i;
+  const firstLine = typeof source.data.bodyExcerpt === "string"
+    ? source.data.bodyExcerpt.split(/\r?\n/).map(line => line.trim()).find(Boolean) || "" : "";
+  const explicitCourtesyStop = courtesyStop.test(quote) && courtesyStop.test(firstLine) && firstLine.includes(quote);
   if (source.data.bodyAvailability !== "available" || typeof source.data.bodyExcerpt !== "string"
-    || !source.data.bodyExcerpt.includes(quote) || !stopRequest.test(quote)) {
+    || !source.data.bodyExcerpt.includes(quote) || !(stopRequest.test(quote) || explicitCourtesyStop)) {
     refuse("invalid_opt_out_evidence", "The quote must appear in the saved incoming body and contain an explicit stop request.");
   }
 }

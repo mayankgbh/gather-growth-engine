@@ -22,7 +22,7 @@ export async function GET(request: Request) {
       hasInstantlyConnection: !!workspace?.instantlyKey,
       hasDirectAttioConnection: !!process.env.ATTIO_API_KEY,
       hasOwnerAlertConnection: !!process.env.RESEND_API_KEY,
-      sendingEnabled: false,
+      sendingEnabled: process.env.MANAGED_OUTREACH_SEND_ENABLED === "true",
       activationBoundary: "Fresh checks are required immediately before provider activation. Provider delivery is asynchronous.",
     };
     if (!workspace?.instantlyKey) return NextResponse.json({ ...base, accounts: [], blockers: ["No saved Instantly connection in the authorized owner's workspace."] }, { headers });

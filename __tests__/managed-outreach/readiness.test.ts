@@ -27,7 +27,7 @@ describe("managed outreach readiness boundary", () => {
     jest.resetAllMocks();
     process.env = { ...originalEnv, MANAGED_OUTREACH_OWNER_EMAIL: "owner@example.com",
       MANAGED_OUTREACH_SERVICE_SECRET: serviceSecret, ATTIO_API_KEY: "synthetic-attio-secret",
-      RESEND_API_KEY: "synthetic-resend-secret" };
+      RESEND_API_KEY: "synthetic-resend-secret", MANAGED_OUTREACH_SEND_ENABLED: "false" };
     getServerSession.mockResolvedValue(null);
     prisma.user.findUnique.mockResolvedValue({ id: "owner-id", email: "owner@example.com" });
     prisma.workspace.findUnique.mockResolvedValue({ id: "workspace-id", domain: "example.com", instantlyKey: encryptedKey });
@@ -79,6 +79,13 @@ describe("managed outreach readiness boundary", () => {
     }
     expect(decrypt).not.toHaveBeenCalled();
     expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("reports the actual managed send configuration without enabling any provider activity", async () => {
+    process.env.MANAGED_OUTREACH_SEND_ENABLED = "true";
+    const response = await GET(request());
+    expect((await response.json()).sendingEnabled).toBe(true);
+    expect(fetcher.mock.calls.every(([, init]) => init.method === "GET")).toBe(true);
   });
 
   it("returns only safe account metadata and performs only the inventory GET", async () => {
