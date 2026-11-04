@@ -44,4 +44,27 @@ describe("uncertain stage reconciliation", () => {
     const h = fixture(); h.client.listEmails.mockRejectedValue(new Error("pagination incomplete"));
     await expect(h.run()).rejects.toThrow("pagination incomplete");
   });
+
+  it("identifies an exact empty campaign interrupted before its fingerprint was persisted", async () => {
+    const h = fixture(); h.job.sequenceFingerprint = null; h.client.listCampaignLeads.mockResolvedValue([]);
+    const step = h.campaign.sequences[0].steps[0] as any;
+    step.delay_unit = "days"; step.pre_delay_unit = "days";
+    step.variants[0].body = step.variants[0].body.replace(/<br\/>/g, "<br />").replace(/&#39;/g, "'");
+    const result = await h.run();
+    expect(result).toMatchObject({ reconcilable: false, recoverableEmptyStage: true });
+    expect(result.campaign.bodyMatches).toBe(true);
+    expect(h.client.uploadVerifiedLead).not.toHaveBeenCalled();
+  });
+
+  it.each(["stage_resume_authorized", "provider_mutation_diagnostic", "activation_attempted", "incoming_received"])("never authorizes a blind empty-stage retry after %s", async type => {
+    const h = fixture(); h.job.sequenceFingerprint = null; h.client.listCampaignLeads.mockResolvedValue([]);
+    h.events.push({ id: "prior", type, occurredAt: new Date(), dataJson: "{}" });
+    expect((await h.run()).recoverableEmptyStage).toBe(false);
+  });
+
+  it.each([{ pre_delay: 1 }, { pre_delay_unit: "hours" }, { new_provider_control: true }])("holds non-equivalent sequence timing or unknown controls: %j", async patch => {
+    const h = fixture(); h.job.sequenceFingerprint = null; h.client.listCampaignLeads.mockResolvedValue([]);
+    Object.assign(h.campaign.sequences[0].steps[0], patch);
+    expect((await h.run()).recoverableEmptyStage).toBe(false);
+  });
 });
