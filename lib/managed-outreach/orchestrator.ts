@@ -230,6 +230,8 @@ export async function dispatchManagedJob(owner: { userId: string; workspaceId: s
   }
   let campaignId = claimed.providerCampaignId || undefined;
   let mutationStarted = false;
+  let phase = "preflight_receipt";
+  let uploadCounts: Record<string, number> | undefined;
   try {
     await persistence.upsertEvent({ id: `managed:preflight:${job.id}:${job.nextStep}:${randomUUID()}`, workspaceId: owner.workspaceId, jobId: job.id,
       type: "preflight_checked", occurredAt: now(), data: { action: input.action, step: job.nextStep, experimentId: job.experimentId, variant: job.variant,
@@ -237,15 +239,40 @@ export async function dispatchManagedJob(owner: { userId: string; workspaceId: s
     if (input.action === "stage") {
       let campaign: ManagedInstantlyCampaign;
       if (job.nextStep === 1) {
-        if (campaignId) block("stage_reconciliation_required", "A provider campaign already exists without a complete stage receipt; review it before retrying.");
+        if (campaignId) {
+          const authorization = events.find(event => event.id === `managed:stage-resume:${job.id}:1` && event.type === "stage_resume_authorized");
+          const proof = authorization ? eventData(authorization) : null;
+          if (!proof || proof.campaignId !== campaignId || proof.sequenceFingerprint !== job.sequenceFingerprint
+            || proof.bodyHash !== rendered.bodyHash || proof.localDate !== rendered.localDate) block("stage_reconciliation_required", "A provider campaign already exists without a complete stage receipt; review it before retrying.");
+          phase = "resume_existing_empty_campaign";
+          campaign = await client.getCampaign(campaignId);
+          if (campaign.id !== campaignId || campaign.name !== `Gather managed ${job.id} ${job.variant}` || campaign.status !== 2
+            || campaign.email_list?.length !== 1 || campaign.email_list[0].toLowerCase() !== job.senderEmail || (campaign.email_tag_list?.length ?? 0)
+            || campaign.stop_on_reply !== true || campaign.stop_on_auto_reply !== true || campaign.stop_for_company !== true
+            || fingerprintCampaignSequence(campaign) !== job.sequenceFingerprint) block("recovery_campaign_changed", "The reviewed empty campaign changed; keep this stage held.");
+          if ((await client.listCampaignLeads(campaignId)).length || (await client.listEmails({ campaignId })).length) block("recovery_campaign_nonempty", "The reviewed campaign is no longer empty; no upload was repeated.");
+          validateClearances(input, candidate, now(), 300_000);
+        } else {
+          mutationStarted = true;
+          phase = "create_paused_campaign";
+          // Provider timezone governs delivery; the preflight window already uses the recorded recipient timezone.
+          campaign = await client.createPausedCampaign({ name: `Gather managed ${job.id} ${job.variant}`, senderEmails: [job.senderEmail],
+            subject: steps[0].subject, bodyText: rendered.body, bodyHtml: rendered.html, ...providerSchedule(now(), candidate.recipientTimezone) });
+          campaignId = campaign.id;
+        }
+        phase = "created_sequence_fingerprint";
+        const createdFingerprint = fingerprintCampaignSequence(campaign);
+        const intendedFingerprint = fingerprintCampaignSequence({ ...campaign, sequences: [{ steps: [{ type: "email", delay: 0, variants: [{ subject: steps[0].subject, body: rendered.html }] }] }] });
+        if (createdFingerprint !== intendedFingerprint) block("created_copy_changed", "Provider subject or body differs from the approved rendered email; hold before lead upload.");
+        phase = "persist_created_campaign";
+        await persistence.updateWithLease(job.id, owner.workspaceId, claimed.leaseToken, { providerCampaignId: campaignId, sequenceFingerprint: createdFingerprint }, now());
+        phase = "upload_verified_lead";
         mutationStarted = true;
-        // Provider timezone governs delivery; the preflight window already uses the recorded recipient timezone.
-        campaign = await client.createPausedCampaign({ name: `Gather managed ${job.id} ${job.variant}`, senderEmails: [job.senderEmail],
-          subject: steps[0].subject, bodyText: rendered.body, bodyHtml: rendered.html, ...providerSchedule(now(), candidate.recipientTimezone) });
-        campaignId = campaign.id;
-        await persistence.updateWithLease(job.id, owner.workspaceId, claimed.leaseToken, { providerCampaignId: campaignId, sequenceFingerprint: fingerprintCampaignSequence(campaign) }, now());
         const uploaded = await client.uploadVerifiedLead(campaignId, { email: job.email, companyName: candidate.company,
           verificationEvidence: `${candidate.emailVerification.source} ${candidate.emailVerification.checkedAt}; non-catch-all verified` });
+        uploadCounts = { leads_uploaded: uploaded.leads_uploaded, in_blocklist: uploaded.in_blocklist, duplicated_leads: uploaded.duplicated_leads,
+          skipped_count: uploaded.skipped_count, invalid_email_count: uploaded.invalid_email_count, created_leads: uploaded.created_leads.length };
+        phase = "validate_lead_upload";
         if (uploaded.leads_uploaded !== 1 || uploaded.in_blocklist !== 0 || uploaded.duplicated_leads !== 0 || uploaded.skipped_count !== 0 || uploaded.invalid_email_count !== 0 || uploaded.created_leads.length !== 1) block("upload_not_confirmed", "The exact verified recipient upload was not confirmed.");
       } else {
         if (!campaignId) block("missing_campaign", "A threaded followup requires the original provider campaign.");
@@ -255,10 +282,12 @@ export async function dispatchManagedJob(owner: { userId: string; workspaceId: s
         await persistence.upsertEvent({ id: `managed:append-intent:${job.id}:${job.nextStep}`, workspaceId: owner.workspaceId, jobId: job.id, type: "append_planned", occurredAt: now(),
           data: { campaignId, beforeFingerprint: proof.expectedSequenceFingerprint, afterFingerprint: plan.sequenceFingerprint, step: job.nextStep } });
         mutationStarted = true;
+        phase = "append_next_step";
         const appended = await client.appendNextStep(campaignId, { ...proof, bodyText: rendered.body, bodyHtml: rendered.html, delayDays: steps[job.nextStep - 1].delayDays });
         campaign = appended.campaign;
       }
       const fingerprint = fingerprintCampaignSequence(campaign);
+      phase = "persist_stage_receipt";
       await persistence.upsertEvent({ id: `managed:staged:${job.id}:${job.nextStep}`, workspaceId: owner.workspaceId, jobId: job.id, type: "staged", occurredAt: now(),
         data: { provider: "instantly", campaignId, step: job.nextStep, experimentId: job.experimentId, variant: job.variant,
           localDate: rendered.localDate, bodyHash: rendered.bodyHash, sequenceFingerprint: fingerprint } });
@@ -276,8 +305,10 @@ export async function dispatchManagedJob(owner: { userId: string; workspaceId: s
       data: { reservationId, provider: "instantly", campaignId, step: job.nextStep, experimentId: job.experimentId, variant: job.variant, preflightCheckedAt: checkedAt } });
     // This is the only point that queues a provider send. A queued result is never a sent receipt.
     mutationStarted = true;
+    phase = "activate_campaign";
     if (job.nextStep === 1) await client.activateCampaign(campaignId, { preflightCheckedAt: checkedAt, expectedRecipientEmail: job.email, expectedSenderEmail: job.senderEmail });
     else await client.activateNextStep(campaignId, { ...followupProof!, preflightCheckedAt: checkedAt });
+    phase = "persist_queued_receipt";
     await persistence.upsertEvent({ id: `managed:queued:${job.id}:${job.nextStep}`, workspaceId: owner.workspaceId, jobId: job.id, type: "activation_queued", occurredAt: now(),
       data: { reservationId, provider: "instantly", campaignId, step: job.nextStep, experimentId: job.experimentId, variant: job.variant, preflightCheckedAt: checkedAt } });
     const queued = await persistence.updateWithLease(job.id, owner.workspaceId, claimed.leaseToken, { status: "queued", lastError: null }, now());
@@ -292,6 +323,18 @@ export async function dispatchManagedJob(owner: { userId: string; workspaceId: s
       // A known campaign is paused as a best effort. Never claim that pause succeeded if the request fails.
       if (campaignId || providerId) { try { await client.pauseCampaign((campaignId || providerId)!); } catch { /* Keep uncertain; do not retry sends. */ } }
       await persistence.markMutationUncertain(job.id, owner.workspaceId, claimed.leaseToken, reason, campaignId || providerId);
+      // Diagnostic facts only: never retain raw exceptions, provider bodies, keys,
+      // request payloads or recipient lists. This event cannot authorize a retry.
+      try {
+        await persistence.upsertEvent({ id: `managed:mutation-diagnostic:${job.id}:${job.nextStep}:${randomUUID()}`, workspaceId: owner.workspaceId, jobId: job.id,
+          type: "provider_mutation_diagnostic", occurredAt: now(), data: { provider: "instantly", action: input.action, step: job.nextStep, phase,
+            campaignId: campaignId || providerId || null, mutationStarted,
+            errorClass: error instanceof ManagedInstantlyError ? "provider" : error instanceof ManagedDispatchError ? "dispatch_guard" : "internal",
+            providerCode: error instanceof ManagedInstantlyError ? error.code : null,
+            providerHttpStatus: error instanceof ManagedInstantlyError ? error.status ?? null : null,
+            providerOutcomeUnknown: error instanceof ManagedInstantlyError ? error.outcomeUnknown : null,
+            ...(uploadCounts ? { uploadCounts } : {}) } });
+      } catch { /* The uncertain hold is already durable; diagnostics never trigger a retry. */ }
     } else if (reservationId) {
       // Only a provably pre-attempt failure can cancel its reservation. The store
       // preserves both receipts and refuses cancellation after an activation marker.

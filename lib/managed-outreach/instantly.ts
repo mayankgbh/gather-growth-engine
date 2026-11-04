@@ -88,6 +88,8 @@ export type InstantlySequenceStep = {
   type: string;
   delay?: number;
   delay_unit?: "days" | "hours" | "minutes";
+  pre_delay?: number;
+  pre_delay_unit?: "days" | "hours" | "minutes";
   variants: Array<{ subject: string; body: string; v_disabled?: boolean }>;
 };
 export type ManagedInstantlyLead = {
@@ -260,15 +262,22 @@ function canonicalJson(value: unknown): string {
     .map(key => `${JSON.stringify(key)}:${canonicalJson(obj[key])}`).join(",")}}`;
 }
 
+/** Exact equivalent serialization observed in Instantly's stored HTML (2026-11-04). */
+export function canonicalInstantlyHtml(html: string): string {
+  return html.replace(/<br \/>/g, "<br/>").replace(/&#39;/g, "'");
+}
+
 function validatedFollowupSequences(campaign: ManagedInstantlyCampaign): InstantlySequence[] {
   const sequences = campaign.sequences;
   if (!Array.isArray(sequences) || sequences.length !== 1 || !Array.isArray(sequences[0].steps)
     || sequences[0].steps.length < 1 || sequences[0].steps.length > 5
     || Object.keys(sequences[0]).some(key => key !== "steps")) blocked("A single managed sequence of at most five steps is required.");
   sequences[0].steps.forEach((step, index) => {
-    if (!step || Object.keys(step).some(key => !["type", "delay", "delay_unit", "variants"].includes(key))
+    if (!step || Object.keys(step).some(key => !["type", "delay", "delay_unit", "pre_delay", "pre_delay_unit", "variants"].includes(key))
       || step.type !== "email" || !Number.isInteger(step.delay) || Number(step.delay) < 0 || Number(step.delay) > 366
       || (step.delay_unit !== undefined && step.delay_unit !== "days")
+      || (step.pre_delay !== undefined && step.pre_delay !== 0)
+      || (step.pre_delay_unit !== undefined && step.pre_delay_unit !== "days")
       || !Array.isArray(step.variants) || step.variants.length !== 1) blocked("Unexpected sequence shape or timing; hold for review.");
     const variant = step.variants[0];
     if (!variant || Object.keys(variant).some(key => !["subject", "body", "v_disabled"].includes(key))
@@ -282,7 +291,9 @@ function validatedFollowupSequences(campaign: ManagedInstantlyCampaign): Instant
 /** Persist this fingerprint with the managed dispatch; never silently adopt edits from the provider. */
 export function fingerprintCampaignSequence(campaign: ManagedInstantlyCampaign): string {
   const sequences = validatedFollowupSequences(campaign);
-  return createHash("sha256").update(canonicalJson(sequences)).digest("hex");
+  const canonical = sequences.map(sequence => ({ steps: sequence.steps.map(step => ({ type: step.type, delay: step.delay, delay_unit: "days",
+    variants: step.variants.map(variant => ({ subject: variant.subject, body: canonicalInstantlyHtml(variant.body), v_disabled: false })) })) }));
+  return createHash("sha256").update(canonicalJson(canonical)).digest("hex");
 }
 
 /** Pure plan: callers can persist the intended new fingerprint BEFORE a provider mutation. */
@@ -468,7 +479,7 @@ export function createManagedInstantlyClient(apiKey: string, options: {
         return parse(await response.json());
       } catch {
         throw new ManagedInstantlyError("Instantly returned an invalid response; reconciliation is required for mutations.", {
-          code: "invalid_response", outcomeUnknown: !!args.mutation,
+          code: "invalid_response", status: response.status, outcomeUnknown: !!args.mutation,
         });
       }
     } catch (error) {

@@ -31,7 +31,7 @@ function harness() {
     nextStep: 1, dueAt: null, leaseToken: null, leaseUntil: null, lastError: null, createdAt: NOW, updatedAt: NOW } as ManagedOutreachJob;
   const events: ManagedOutreachEvent[] = [];
   const campaign = { id: "campaign-1", name: "Example", status: 2, email_list: [config.senderEmail], stop_on_reply: true,
-    stop_on_auto_reply: true, stop_for_company: true, sequences: [{ steps: [{ type: "email", delay: 0, variants: [{ subject: steps[0].subject, body: "provider body" }] }] }] };
+    stop_on_auto_reply: true, stop_for_company: true, sequences: [{ steps: [{ type: "email", delay: 0, variants: [{ subject: steps[0].subject, body: renderManagedBody(steps[0].body, NOW, candidate.recipientTimezone, config.footer).html }] }] }] };
   const client = {
     listAccounts: jest.fn().mockResolvedValue([{ email: config.senderEmail, status: 1, setup_pending: false, warmup_status: 1, daily_limit: 20 }]),
     listAccountCampaigns: jest.fn().mockResolvedValue([]), isSuppressed: jest.fn().mockResolvedValue(false), listInboundEmails: jest.fn().mockResolvedValue([]),
@@ -57,6 +57,35 @@ function harness() {
 describe("managed outbound orchestration", () => {
   beforeEach(() => { jest.useFakeTimers({ now: NOW }); });
   afterEach(() => { jest.useRealTimers(); });
+
+  it("records mutation phase and safe provider diagnostics without raw errors or recipient data", async () => {
+    const h = harness();
+    h.client.uploadVerifiedLead.mockRejectedValueOnce(new ManagedInstantlyError("secret provider payload buyer@example.com", { code: "invalid_response", status: 200, outcomeUnknown: true }));
+    await expect(h.run()).rejects.toMatchObject({ code: "mutation_uncertain" });
+    const event = h.events.find(item => item.type === "provider_mutation_diagnostic")!;
+    expect(JSON.parse(event.dataJson)).toMatchObject({ phase: "upload_verified_lead", providerCode: "invalid_response", providerHttpStatus: 200, providerOutcomeUnknown: true });
+    expect(event.dataJson).not.toMatch(/secret|buyer@example.com/);
+    expect(h.client.activateCampaign).not.toHaveBeenCalled();
+  });
+
+  it("records actual skip counts and keeps an unconfirmed recipient upload held", async () => {
+    const h = harness(); h.client.uploadVerifiedLead.mockResolvedValueOnce({ leads_uploaded: 0, in_blocklist: 0, duplicated_leads: 0, skipped_count: 1, invalid_email_count: 0, created_leads: [] });
+    await expect(h.run()).rejects.toMatchObject({ code: "mutation_uncertain" });
+    const event = h.events.find(item => item.type === "provider_mutation_diagnostic")!;
+    expect(JSON.parse(event.dataJson)).toMatchObject({ phase: "validate_lead_upload", uploadCounts: { leads_uploaded: 0, skipped_count: 1, created_leads: 0 } });
+    expect(h.getJob().status).toBe("uncertain");
+  });
+
+  it("holds provider content edits before uploading, allowing only observed equivalent serialization", async () => {
+    const bad = harness(); bad.campaign.sequences[0].steps[0].variants[0].body += "changed copy";
+    await expect(bad.run()).rejects.toMatchObject({ code: "mutation_uncertain" });
+    expect(bad.client.uploadVerifiedLead).not.toHaveBeenCalled();
+    const equivalent = harness();
+    const step = equivalent.campaign.sequences[0].steps[0] as any;
+    step.delay_unit = "days"; step.pre_delay_unit = "days";
+    step.variants[0].body = step.variants[0].body.replace(/<br\/>/g, "<br />").replace(/&#39;/g, "'");
+    expect((await equivalent.run()).status).toBe("staged");
+  });
 
   it("imports exactly five completed same-subject emails with a selected sender", () => {
     expect(parseManagedImport({ externalId: "p1", candidate, steps, experimentId: "exp", variant: "A", senderEmail: config.senderEmail }, config).steps).toHaveLength(5);
