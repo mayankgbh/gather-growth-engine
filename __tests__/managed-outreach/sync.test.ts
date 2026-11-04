@@ -121,6 +121,16 @@ beforeEach(() => {
 });
 
 describe("managed outreach provider reconciliation", () => {
+  it("preserves an exactly authorized empty recovery awaiting its first upload", async () => {
+    providerCampaign.status = 2; jobs[0].status = "held"; providerEmails = [];
+    (client.listCampaignLeads as jest.Mock).mockResolvedValue([]);
+    events.splice(0, events.length, { id: "managed:stage-resume:job-a:1", type: "stage_resume_authorized", jobId: "job-a", workspaceId: "workspace-a",
+      occurredAt: now, dataJson: JSON.stringify({ campaignId: "campaign-a", sequenceFingerprint: jobs[0].sequenceFingerprint }) });
+    const result = await syncManagedOutreach("workspace-a", client, { now });
+    expect(result.complete).toBe(true); expect(jobs[0].status).toBe("held");
+    expect(client.pauseCampaign).not.toHaveBeenCalled();
+    expect(jobs[0].nextStep).toBe(1);
+  });
   it("operationally pauses a still-active campaign after all present steps are proven sent", async () => {
     providerCampaign.status = 1;
     const result = await syncManagedOutreach("workspace-a", client, { now });

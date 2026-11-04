@@ -235,8 +235,22 @@ export async function syncManagedOutreach(workspaceId: string, client: ManagedIn
         // An active worker may legitimately be between those writes. Still stop on
         // incoming/negative state, but leave progress reconciliation for its next scan.
         const activeWorker = current.status === "claimed" && !!current.leaseUntil && current.leaseUntil.getTime() > now.getTime();
+        // A reviewed recovery may remain held by another mailbox user before its
+        // first upload. Its proven empty state is legitimate, not a lost recipient.
+        const awaitingFirstUpload = completeReads && !activeWorker && current.status === "held" && current.nextStep === 1
+          && !current.leaseToken && !current.leaseUntil && leads!.length === 0 && sent!.length === 0 && incoming!.length === 0
+          && campaign!.id === current.providerCampaignId && campaign!.status === 2 && campaign!.email_list?.length === 1
+          && recipient(campaign!.email_list[0]) === current.senderEmail && !(campaign!.email_tag_list?.length)
+          && campaign!.stop_on_reply === true && campaign!.stop_on_auto_reply === true && campaign!.stop_for_company === true
+          && campaign!.sequences?.[0]?.steps.length === 1 && fingerprintCampaignSequence(campaign!) === current.sequenceFingerprint
+          && !events.some(event => ["staged", "activation_attempted", "activation_queued", "sent", "provider_mutation_diagnostic"].includes(event.type))
+          && events.some(event => {
+            if (event.id !== `managed:stage-resume:${current.id}:1` || event.type !== "stage_resume_authorized") return false;
+            const authorization = objectJson(event.dataJson);
+            return authorization.campaignId === current.providerCampaignId && authorization.sequenceFingerprint === current.sequenceFingerprint;
+          });
         let progress: ReturnType<typeof validateSentHistory> | null = null;
-        if (completeReads && !activeWorker) {
+        if (completeReads && !activeWorker && !awaitingFirstUpload) {
           try { progress = validateSentHistory(current, events, campaign!, sent!, leads!, now); }
           catch (error) { problems.push(error instanceof SyncEvidenceError ? error.code : "invalid_provider_evidence"); }
         }
