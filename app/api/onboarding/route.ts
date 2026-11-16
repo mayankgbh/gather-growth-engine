@@ -18,6 +18,7 @@ export async function POST(request: Request) {
     const instantlyKey = typeof body.instantlyKey === "string" ? body.instantlyKey.trim() : "";
     const lumaApiKey = typeof body.lumaApiKey === "string" ? body.lumaApiKey.trim() : "";
     const runwayApiKey = typeof body.runwayApiKey === "string" ? body.runwayApiKey.trim() : "";
+    const gatherApiKey = typeof body.gatherApiKey === "string" ? body.gatherApiKey.trim() : "";
     const senderName = typeof body.senderName === "string" ? body.senderName.trim() || null : null;
     const similarCompanies = typeof body.similarCompanies === "string" ? body.similarCompanies.trim() || null : null;
     const referralPhrase = typeof body.referralPhrase === "string" ? body.referralPhrase.trim() || null : null;
@@ -43,6 +44,7 @@ export async function POST(request: Request) {
     const encryptedInstantlyKey = instantlyKey ? encrypt(instantlyKey) : null;
     const encryptedLumaKey = lumaApiKey ? encrypt(lumaApiKey) : null;
     const encryptedRunwayKey = runwayApiKey ? encrypt(runwayApiKey) : null;
+    const encryptedGatherKey = gatherApiKey ? encrypt(gatherApiKey) : null;
 
     const socialProofJson =
       (similarCompanies?.trim() || referralPhrase?.trim())
@@ -60,6 +62,7 @@ export async function POST(request: Request) {
         ...(instantlyKey && { instantlyKey: encryptedInstantlyKey }),
         ...(lumaApiKey && { lumaApiKey: encryptedLumaKey }),
         ...(runwayApiKey && { runwayApiKey: encryptedRunwayKey }),
+        ...(gatherApiKey && { gatherApiKey: encryptedGatherKey }),
       },
       create: {
         userId: session.user.id,
@@ -70,6 +73,7 @@ export async function POST(request: Request) {
         instantlyKey: encryptedInstantlyKey,
         lumaApiKey: encryptedLumaKey,
         runwayApiKey: encryptedRunwayKey,
+        gatherApiKey: encryptedGatherKey,
       },
     });
 
@@ -109,6 +113,7 @@ export async function GET(request: Request) {
         instantlyKey: true,
         lumaApiKey: true,
         runwayApiKey: true,
+        gatherApiKey: true,
       },
     });
 
@@ -116,13 +121,14 @@ export async function GET(request: Request) {
       return NextResponse.json({ workspace: null }, { status: 200 });
     }
 
-    const { anthropicKey: _ak, instantlyKey: _ik, lumaApiKey: _lk, runwayApiKey: _rk, ...rest } = row;
+    const { anthropicKey: _ak, instantlyKey: _ik, lumaApiKey: _lk, runwayApiKey: _rk, gatherApiKey: _gk, ...rest } = row;
     const workspace = {
       ...rest,
       hasAnthropicKey: Boolean(_ak),
       hasInstantlyKey: Boolean(_ik),
       hasLumaKey: Boolean(_lk),
       hasRunwayKey: Boolean(_rk),
+      hasGatherKey: Boolean(_gk),
     };
 
     return NextResponse.json({ workspace }, { status: 200 });

@@ -26,6 +26,7 @@ export interface LandingPageContent {
   assetTitle: string;               // e.g. "Sample: AI-powered brand health brief for Acme"
   assetSummary: string;             // 2–3 sentences framing what the brief covers
   assetFindings: SyntheticFinding[];
+  assetSource: "gather" | "illustrative"; // "illustrative" = written by the LLM, not Gather research
   socialProof: string;              // 1–2 sentences of relevant proof
   ctaLabel: string;
   ctaUrl: string;
@@ -43,7 +44,7 @@ interface ContentGenInput {
   ctaUrl: string;
 }
 
-const SYNTHETIC_MCP_URL = "https://synthetic.gatherhq.com/mcp";
+const SYNTHETIC_MCP_URL = "https://synthetic.gatherhq.com/api/v1/mcp";
 const ANTHROPIC_API = "https://api.anthropic.com/v1/messages";
 
 /** 
@@ -52,7 +53,8 @@ const ANTHROPIC_API = "https://api.anthropic.com/v1/messages";
  */
 export async function generateLandingPageContent(
   input: ContentGenInput,
-  anthropicKey: string
+  anthropicKey: string,
+  gatherKey?: string | null
 ): Promise<LandingPageContent> {
   const { name, jobTitle, company, industry, research, productSummary, senderName, socialProof, ctaUrl } = input;
   const firstName = name?.split(/\s+/)[0] || "there";
@@ -82,7 +84,7 @@ Use the synthetic data tool to generate 3–4 realistic research findings for a 
 
 Then return a JSON object with EXACTLY these keys — no markdown, no preamble:
 {
-  "headline": "A specific, compelling headline for ${firstName} at ${company ?? "their company"} — what insight or outcome awaits them (e.g. 'How [Company] could cut research time by 10x')",
+  "headline": "A specific, compelling headline for ${firstName} at ${company ?? "their company"} — what insight or outcome awaits them. No numbers or statistics here, in subheadline or in senderIntro",
   "subheadline": "1–2 sentences: specific context about their situation and what this page shows them",
   "senderIntro": "1–2 sentences written as ${senderName}: what prompted reaching out, referencing a specific observation about ${company ?? "the company"} — conversational, not salesy",
   "observations": ${JSON.stringify(research.observations)},
@@ -99,8 +101,8 @@ Then return a JSON object with EXACTLY these keys — no markdown, no preamble:
   "ctaUrl": "${ctaUrl}"
 }`;
 
-  // Try with synthetic MCP first (Sonnet for tool use)
-  try {
+  // Try with synthetic MCP first (Sonnet for tool use). The server needs a Gather key; skip without one.
+  if (gatherKey) try {
     const res = await fetch(ANTHROPIC_API, {
       method: "POST",
       headers: {
@@ -117,6 +119,7 @@ Then return a JSON object with EXACTLY these keys — no markdown, no preamble:
             type: "url",
             url: SYNTHETIC_MCP_URL,
             name: "gather-synthetic",
+            authorization_token: gatherKey,
           },
         ],
         messages: [{ role: "user", content: prompt }],
@@ -125,6 +128,8 @@ Then return a JSON object with EXACTLY these keys — no markdown, no preamble:
 
     if (res.ok) {
       const data = await res.json();
+      // Only label the asset "gather" when a Gather tool call actually returned a result
+      const usedGather = (data.content ?? []).some((b: { type: string; is_error?: boolean }) => b.type === "mcp_tool_result" && !b.is_error);
       // Extract the final text block (after any MCP tool use)
       const textBlocks = (data.content ?? []).filter((b: { type: string }) => b.type === "text");
       const rawText = textBlocks.map((b: { text: string }) => b.text).join("").trim();
@@ -132,12 +137,14 @@ Then return a JSON object with EXACTLY these keys — no markdown, no preamble:
         const clean = rawText.replace(/```json|```/g, "").trim();
         const lastJson = extractLastJson(clean);
         if (lastJson) {
-          return normaliseLandingPageContent(JSON.parse(lastJson), ctaUrl);
+          return normaliseLandingPageContent({ ...JSON.parse(lastJson), assetSource: usedGather ? "gather" : "illustrative" }, ctaUrl);
         }
       }
+    } else {
+      console.warn(`Gather MCP call failed: ${res.status} - ${await res.text().catch(() => "")}`);
     }
-  } catch {
-    // Fall through to non-MCP path
+  } catch (err) {
+    console.warn("Gather MCP call failed:", err instanceof Error ? err.message : err);
   }
 
   // Fallback: Claude without MCP (Haiku, cheaper, still generates synthetic data inline)
@@ -150,7 +157,7 @@ Then return a JSON object with EXACTLY these keys — no markdown, no preamble:
   const clean = text.replace(/```json|```/g, "").trim();
   const lastJson = extractLastJson(clean);
   if (lastJson) {
-    return normaliseLandingPageContent(JSON.parse(lastJson), ctaUrl);
+    return normaliseLandingPageContent({ ...JSON.parse(lastJson), assetSource: "illustrative" }, ctaUrl);
   }
 
   // Hard fallback: minimal valid content
@@ -165,7 +172,7 @@ function extractLastJson(text: string): string | null {
   return text.slice(start, end + 1);
 }
 
-function normaliseLandingPageContent(parsed: Partial<LandingPageContent>, ctaUrl: string): LandingPageContent {
+export function normaliseLandingPageContent(parsed: Partial<LandingPageContent>, ctaUrl: string): LandingPageContent {
   return {
     headline: parsed.headline ?? "A research brief, just for you",
     subheadline: parsed.subheadline ?? "",
@@ -175,13 +182,14 @@ function normaliseLandingPageContent(parsed: Partial<LandingPageContent>, ctaUrl
     assetTitle: parsed.assetTitle ?? "Sample research brief",
     assetSummary: parsed.assetSummary ?? "",
     assetFindings: Array.isArray(parsed.assetFindings) ? parsed.assetFindings.slice(0, 4) : [],
+    assetSource: parsed.assetSource === "gather" ? "gather" : "illustrative",
     socialProof: parsed.socialProof ?? "",
     ctaLabel: parsed.ctaLabel ?? "Book a demo",
     ctaUrl: ctaUrl || parsed.ctaUrl || "#",
   };
 }
 
-function buildFallback(input: ContentGenInput): LandingPageContent {
+export function buildFallback(input: ContentGenInput): LandingPageContent {
   const { name, company, research, ctaUrl } = input;
   const firstName = name?.split(/\s+/)[0] || "there";
   return {
@@ -192,11 +200,8 @@ function buildFallback(input: ContentGenInput): LandingPageContent {
     assetType: "research_brief",
     assetTitle: `Sample: ${research.assetAngle} for ${company ?? "your company"}`,
     assetSummary: `Based on what we know about ${company ?? "your company"}'s situation, here's what AI-powered research could surface.`,
-    assetFindings: [
-      { label: "Time saved", value: "~8 hrs/week", insight: "Teams using AI research tools reclaim hours previously spent on manual analysis." },
-      { label: "Insight speed", value: "10×", insight: "AI can synthesize survey data, competitor signals, and brand sentiment in minutes." },
-      { label: "Sample size", value: "500+ respondents", insight: "Typical studies can run in 24–48 hours vs. weeks with traditional methods." },
-    ],
+    assetFindings: [],
+    assetSource: "illustrative",
     socialProof: input.socialProof || "",
     ctaLabel: "Book a 20-min demo",
     ctaUrl: ctaUrl || "#",

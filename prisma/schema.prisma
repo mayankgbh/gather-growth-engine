@@ -76,6 +76,7 @@ model Workspace {
   instantlyKey    String?  // encrypted
   lumaApiKey      String?  // encrypted — for AI video (Luma Dream Machine)
   runwayApiKey    String?  // encrypted — for AI video (Runway Gen-3)
+  gatherApiKey    String?  // encrypted — for Gather synthetic research (landing page findings)
   productSummary  String?  // populated after crawl
   icp             String?  // Ideal Customer Profile (free text)
   proofPointsJson String?  // JSON: [{ title?: string; text: string }]
