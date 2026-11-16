@@ -84,7 +84,7 @@ Use the synthetic data tool to generate 3–4 realistic research findings for a 
 
 Then return a JSON object with EXACTLY these keys — no markdown, no preamble:
 {
-  "headline": "A specific, compelling headline for ${firstName} at ${company ?? "their company"} — what insight or outcome awaits them (e.g. 'How [Company] could cut research time by 10x')",
+  "headline": "A specific, compelling headline for ${firstName} at ${company ?? "their company"} — what insight or outcome awaits them. No numbers or statistics here, in subheadline or in senderIntro",
   "subheadline": "1–2 sentences: specific context about their situation and what this page shows them",
   "senderIntro": "1–2 sentences written as ${senderName}: what prompted reaching out, referencing a specific observation about ${company ?? "the company"} — conversational, not salesy",
   "observations": ${JSON.stringify(research.observations)},
