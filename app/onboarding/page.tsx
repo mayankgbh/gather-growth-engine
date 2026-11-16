@@ -18,6 +18,7 @@ export default function OnboardingPage() {
   const [instantlyKey, setInstantlyKey] = useState("");
   const [lumaApiKey, setLumaApiKey] = useState("");
   const [runwayApiKey, setRunwayApiKey] = useState("");
+  const [gatherApiKey, setGatherApiKey] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [existingData, setExistingData] = useState<any>(null);
@@ -85,6 +86,7 @@ export default function OnboardingPage() {
           instantlyKey,
           lumaApiKey,
           runwayApiKey,
+          gatherApiKey,
         }),
       });
 
@@ -261,6 +263,31 @@ export default function OnboardingPage() {
                 placeholder="Paste your Instantly API key"
                 value={instantlyKey}
                 onChange={(e) => setInstantlyKey(e.target.value)}
+                className="mt-1 w-full rounded-md border border-zinc-700 bg-zinc-900 px-4 py-3 text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+              />
+            </div>
+            <div>
+              <label htmlFor="gather_key" className="block text-sm text-zinc-400">
+                Gather API key
+              </label>
+              <p className="mt-0.5 text-xs text-zinc-500">
+                Optional. Landing page findings come from Gather research; without a key they are labeled illustrative.{" "}
+                <a
+                  href="https://www.gatherhq.com/docs/quickstart"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-emerald-500 hover:text-emerald-400"
+                >
+                  Get a key →
+                </a>
+              </p>
+              <input
+                id="gather_key"
+                name="gather_key"
+                type="password"
+                placeholder={existingData?.hasGatherKey ? "•••••••• (leave blank to keep)" : "gk_..."}
+                value={gatherApiKey}
+                onChange={(e) => setGatherApiKey(e.target.value)}
                 className="mt-1 w-full rounded-md border border-zinc-700 bg-zinc-900 px-4 py-3 text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
               />
             </div>

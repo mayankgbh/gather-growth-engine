@@ -46,7 +46,7 @@ export async function POST(request: Request) {
 
     const workspace = await prisma.workspace.findUnique({
       where: { userId: session.user.id },
-      select: { id: true, anthropicKey: true, anthropicModel: true, productSummary: true, icp: true, proofPointsJson: true, socialProofJson: true, playbookJson: true, senderName: true },
+      select: { id: true, anthropicKey: true, gatherApiKey: true, anthropicModel: true, productSummary: true, icp: true, proofPointsJson: true, socialProofJson: true, playbookJson: true, senderName: true },
     });
 
     if (!workspace?.anthropicKey) {
@@ -121,6 +121,7 @@ export async function POST(request: Request) {
           : "";
 
     const anthropicKey = decrypt(workspace.anthropicKey);
+    const gatherKey = workspace.gatherApiKey ? decrypt(workspace.gatherApiKey) : null;
     const useFastModel = useFastModelParam !== false;
     const model = useFastModel ? "claude-haiku-4-5" : (workspace.anthropicModel ?? "claude-haiku-4-5");
     const productSummary = workspace.productSummary ?? "";
@@ -224,7 +225,8 @@ export async function POST(request: Request) {
             socialProof: socialProofStr,
             ctaUrl: campaignCtaUrl ?? "",
           },
-          anthropicKey
+          anthropicKey,
+          gatherKey
         );
 
         // 3. Build rich email block that references actual page content

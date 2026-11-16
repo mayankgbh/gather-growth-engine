@@ -98,7 +98,9 @@ export default async function LandingPage({ params }: { params: Promise<{ token:
               <p className="text-xs font-medium uppercase tracking-widest text-emerald-500/80">{(content as LandingPageContent & { researchBriefLabel?: string }).researchBriefLabel || "Research brief"}</p>
               <h3 className="text-base font-semibold text-zinc-100">{content.assetTitle}</h3>
             </div>
-            <span className="flex-shrink-0 rounded-md border border-zinc-700 bg-zinc-800 px-2 py-1 text-xs text-zinc-500">Sample</span>
+            <span className="flex-shrink-0 rounded-md border border-zinc-700 bg-zinc-800 px-2 py-1 text-xs text-zinc-500">
+              {content.assetSource === "gather" ? "Sample" : "Illustrative example, not research"}
+            </span>
           </div>
 
           {content.assetSummary && (
