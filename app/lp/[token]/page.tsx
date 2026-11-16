@@ -1,6 +1,7 @@
 import { prisma } from "@/lib/prisma";
 import { notFound } from "next/navigation";
 import type { LandingPageContent } from "@/lib/lp-content-gen";
+import { shownContent } from "@/lib/lp-display";
 
 export const dynamic = "force-dynamic";
 
@@ -24,9 +25,13 @@ export default async function LandingPage({ params }: { params: Promise<{ token:
   const firstName = lead.name?.split(/\s+/)[0] || "there";
 
   let content: LandingPageContent | null = null;
+  let showBrief = false;
   try {
     if (lead.landingPageContentJson) {
-      content = JSON.parse(lead.landingPageContentJson) as LandingPageContent;
+      // Never the findings, nor a made-up claim on a page stored before they were taken out (lib/lp-display.ts).
+      const shown = shownContent(JSON.parse(lead.landingPageContentJson), { firstName, company: lead.company });
+      content = shown.content;
+      showBrief = shown.showBrief;
     }
   } catch { /* fall through */ }
 
@@ -55,7 +60,7 @@ export default async function LandingPage({ params }: { params: Promise<{ token:
           <h1 className="text-3xl font-semibold leading-snug tracking-tight text-zinc-50">
             {content.headline}
           </h1>
-          <p className="text-lg text-zinc-400 leading-relaxed">{content.subheadline}</p>
+          {content.subheadline && <p className="text-lg text-zinc-400 leading-relaxed">{content.subheadline}</p>}
         </header>
 
         {content.senderIntro && (() => {
@@ -92,6 +97,10 @@ export default async function LandingPage({ params }: { params: Promise<{ token:
           </section>
         )}
 
+        {/* The research brief box, only on a page made by hand with a real chart or a link to
+            the brief. Generated pages never had a real brief behind them, and the findings they
+            stored were made up (see lib/lp-content-gen.ts), so findings are never shown. */}
+        {showBrief && (
         <section className="rounded-xl border border-zinc-800 bg-zinc-900/30 overflow-hidden">
           <div className="border-b border-zinc-800 px-6 py-4 flex items-start justify-between gap-4">
             <div className="space-y-1">
@@ -104,18 +113,6 @@ export default async function LandingPage({ params }: { params: Promise<{ token:
           {content.assetSummary && (
             <div className="px-6 pt-5 pb-2">
               <p className="text-sm text-zinc-400 leading-relaxed">{content.assetSummary}</p>
-            </div>
-          )}
-
-          {content.assetFindings.length > 0 && (
-            <div className="px-6 py-5 grid grid-cols-1 gap-4 sm:grid-cols-3">
-              {content.assetFindings.map((f: { label: string; value: string; insight: string }, i: number) => (
-                <div key={i} className="rounded-lg bg-zinc-800/50 border border-zinc-700/50 p-4 space-y-1">
-                  <p className="text-xs text-zinc-500 uppercase tracking-wider font-medium">{f.label}</p>
-                  <p className="text-2xl font-semibold text-zinc-100 tabular-nums">{f.value}</p>
-                  <p className="text-xs text-zinc-500 leading-relaxed">{f.insight}</p>
-                </div>
-              ))}
             </div>
           )}
 
@@ -158,6 +155,7 @@ export default async function LandingPage({ params }: { params: Promise<{ token:
             </div>
           </div>
         </section>
+        )}
 
         {content.socialProof && (
           <section className="border-l-2 border-emerald-500/30 pl-5">
