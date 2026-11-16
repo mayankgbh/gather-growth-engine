@@ -203,7 +203,7 @@ export async function POST(request: Request) {
           model
         );
 
-        // 2. Landing page content gen — calls Claude + synthetic MCP
+        // 2. Landing page copy from the lead research; no findings (lib/lp-content-gen.ts)
         const senderNameStr = workspace.senderName?.trim() || "The team";
         const socialProofStr = (() => {
           try {
